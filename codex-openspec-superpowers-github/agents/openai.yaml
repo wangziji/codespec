@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex OpenSpec Workflow"
+  short_description: "Spec-first Codex workflow with OpenSpec"
+  default_prompt: "Use $codex-openspec-superpowers-github to run a feature from GitHub issue through OpenSpec planning, TDD implementation, review, and PR."
