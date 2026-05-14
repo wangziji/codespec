@@ -75,10 +75,12 @@ Commands:
 
 ```bash
 git fetch origin
-git switch main
+git switch <default-branch>
 git pull --ff-only
 git switch -c feature/<issue-number>-<short-slug>
 ```
+
+Use the repository default branch, such as `main` or `master`, for `<default-branch>`.
 
 Skills:
 

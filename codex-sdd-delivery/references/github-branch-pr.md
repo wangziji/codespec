@@ -29,12 +29,12 @@ PR title: feat: add portfolio import
 
 ```bash
 git fetch origin
-git switch main
+git switch <default-branch>
 git pull --ff-only
 git switch -c feature/<issue-number>-<short-slug>
 ```
 
-If the repo uses a default branch other than `main`, use the repo default branch.
+Use the repository default branch, such as `main` or `master`, for `<default-branch>`.
 
 ## Commit Rules
 

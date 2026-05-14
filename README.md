@@ -6,7 +6,10 @@ This repo contains a Codex workflow skill that combines:
 - Superpowers (brainstorming, planning, TDD discipline)
 - GitHub (issue intake + PR publication)
 
-Skill directory: `codex-openspec-superpowers-github/`.
+Skill directories:
+
+- `codex-sdd-delivery/` - recommended Project-first workflow
+- `codex-openspec-superpowers-github/` - narrower issue/change workflow
 
 ## Recommended Workflow
 
@@ -40,18 +43,19 @@ gh auth status
 
 3. Make the skill discoverable to Codex.
 
-Recommended: clone this repo directly into your skills directory as a real folder (avoid symlinks).
+Recommended: from a local checkout of this repo, copy the skill directories into `~/.skills` as real folders (avoid symlinks).
 
 ```bash
 mkdir -p ~/.skills
-git clone git@github.com:wangziji/codespec.git ~/.skills/codex-openspec-superpowers-github
+rsync -a ./codex-sdd-delivery/ ~/.skills/codex-sdd-delivery/
+rsync -a ./codex-openspec-superpowers-github/ ~/.skills/codex-openspec-superpowers-github/
 ```
 
-If you already have the repo somewhere else and want to copy just the skill folder:
+If you only want the recommended Project-first workflow:
 
 ```bash
 mkdir -p ~/.skills
-rsync -a ./codex-openspec-superpowers-github/ ~/.skills/codex-openspec-superpowers-github/
+rsync -a ./codex-sdd-delivery/ ~/.skills/codex-sdd-delivery/
 ```
 
 ## Use
