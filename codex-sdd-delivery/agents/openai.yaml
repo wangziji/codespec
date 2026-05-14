@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex SDD Delivery"
+  short_description: "Project-first SDD workflow for Codex"
+  default_prompt: "Use $codex-sdd-delivery to deliver the next GitHub Project item through issue intake, OpenSpec artifacts, per-spec review, TDD implementation, code review, PR, and archive."
