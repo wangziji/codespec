@@ -16,6 +16,7 @@ Use this map to select the right skill for each SDD delivery phase.
 | External framework or library decisions | `source-driven-development` |
 | High-risk or unfamiliar decisions | `doubt-driven-development` |
 | Task decomposition | `planning-and-task-breakdown`, `superpowers:writing-plans` |
+| Independent artifact review | reviewer agent, `code-review-and-quality`, `doubt-driven-development` when risk is high |
 | Implementation slice | `incremental-implementation`, `superpowers:test-driven-development` |
 | Browser runtime verification | `browser-testing-with-devtools` |
 | Failing tests or unexpected behavior | `debugging-and-error-recovery` |

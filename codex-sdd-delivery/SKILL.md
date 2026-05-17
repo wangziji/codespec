@@ -20,8 +20,9 @@ Before starting work, read these files in order:
 5. `references/skill-map.md`
 6. `references/artifact-gates.md`
 7. `references/spec-review-template.md`
-8. `references/pr-template.md`
-9. `references/project-status-map.md`
+8. `references/reviewer-agents.md`
+9. `references/pr-template.md`
+10. `references/project-status-map.md`
 
 ## Operating Model
 
@@ -30,6 +31,7 @@ Before starting work, read these files in order:
 - Git branch isolates implementation.
 - OpenSpec is the artifact contract.
 - Per-spec reviews are mandatory gates, one review per capability spec.
+- Independent reviewer agents may perform proposal, spec, design, tasks, and code review gates, but reviewer agents must not author or modify the artifact they review.
 - agent-skills provide phase-specific engineering methods.
 - Superpowers enforce hard gates for brainstorming, planning, TDD, and verification.
 - GitHub PR is the delivery evidence packet.
@@ -41,6 +43,7 @@ Stop and repair before continuing when:
 - GitHub Project item, issue, branch, OpenSpec change, or PR links are missing.
 - Any proposal, spec, design, tasks, validation, implementation, review, or PR gate fails.
 - Any spec review is missing or not approved.
+- A reviewer agent edits the reviewed artifact or approves its own work.
 - OpenSpec validation fails.
 - Tests, build, lint, CI, or code review fail.
 - Project status says a later phase than the artifacts support.
