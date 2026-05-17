@@ -124,12 +124,13 @@ Skills:
 - `idea-refine`
 - `spec-driven-development`
 - `superpowers:brainstorming`
+- Proposal Reviewer Agent from `reviewer-agents.md`
 
 Gate:
 
 - `proposal.md` exists at the path printed by OpenSpec.
 - Proposal links Project item and issue.
-- Proposal review is recorded and approved before specs begin.
+- Independent proposal review is recorded and approved before specs begin.
 
 ## 6. Specs Gate
 
@@ -147,12 +148,14 @@ Skills:
 - `security-and-hardening` when auth, permissions, user input, secrets, or privacy are involved
 - `performance-optimization` when latency, throughput, or resource usage matters
 - `superpowers:brainstorming`
+- Spec Reviewer Agent per capability from `reviewer-agents.md`
 
 Gate:
 
 - Every capability has `openspec/changes/<change-name>/specs/<capability>/spec.md`.
 - Every capability has `openspec/changes/<change-name>/reviews/specs/<capability>.review.md`.
 - Every spec review has `Decision: Approved`.
+- Spec reviewer agents did not author or modify the reviewed specs.
 - Design work is forbidden until all spec reviews are approved.
 
 ## 7. Design Gate
@@ -169,12 +172,13 @@ Skills:
 - `doubt-driven-development` for high-risk or unfamiliar decisions
 - `documentation-and-adrs` for architectural decisions
 - `superpowers:brainstorming`
+- Design Reviewer Agent from `reviewer-agents.md`
 
 Gate:
 
 - `design.md` exists at the path printed by OpenSpec.
 - Design explains architecture, data flow, boundaries, error handling, migration, rollout, observability, and test strategy when relevant.
-- Design review is approved before tasks begin.
+- Independent design review is approved before tasks begin.
 
 ## 8. Tasks Gate
 
@@ -190,12 +194,13 @@ Skills:
 
 - `planning-and-task-breakdown`
 - `superpowers:writing-plans`
+- Tasks Reviewer Agent from `reviewer-agents.md`
 
 Gate:
 
 - `tasks.md` exists at the path printed by OpenSpec.
 - Tasks are ordered, test-first, and traceable to specs/design.
-- Tasks review is approved.
+- Independent tasks review is approved.
 - OpenSpec strict validation passes before implementation.
 
 ## 9. Implementation Gate
@@ -255,6 +260,7 @@ Skills:
 - `code-review-and-quality`
 - `security-and-hardening` for security-sensitive changes
 - `doubt-driven-development` for high-risk changes
+- Code Reviewer Agent from `reviewer-agents.md`
 
 Gate:
 
@@ -262,6 +268,7 @@ Gate:
 - Required findings are fixed.
 - CI checks pass.
 - OpenSpec artifacts are updated if implementation changes behavior.
+- Code reviewer agent did not author the implementation slice under review.
 
 ## 12. Pull Request Gate
 

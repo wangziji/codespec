@@ -2,6 +2,8 @@
 
 Each capability spec requires one independent review file.
 
+Spec reviews may be delegated to independent reviewer agents. The reviewer agent must not author or edit the spec under review.
+
 Spec path:
 
 ```text
@@ -58,5 +60,6 @@ The review is approved only when:
 - Required Findings is empty or every item is checked.
 - Checks are complete.
 - Re-review Result says `Decision: Approved`.
+- The reviewer did not author or modify the reviewed spec.
 
 Design phase is blocked until every capability spec has an approved review file.
