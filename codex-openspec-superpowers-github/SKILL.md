@@ -1,13 +1,13 @@
 ---
 name: codex-openspec-superpowers-github
-description: Use when a Codex feature or bugfix request mentions OpenSpec, spec-first development, GitHub issues, Superpowers planning or TDD, code review gates, or PR publication
+description: Use when a Codex feature or bugfix request mentions OpenSpec CLI, spec-first development, GitHub issues, Superpowers planning or TDD, code review gates, or PR publication
 ---
 
 # Codex OpenSpec Superpowers GitHub
 
 ## Overview
 
-Run a spec-first development loop that combines GitHub issue intake, OpenSpec change artifacts, Superpowers brainstorming/planning/TDD discipline, Codex implementation, review repair, and PR publication.
+Run a CLI-first spec-driven development loop that combines GitHub issue intake, OpenSpec change artifacts, Superpowers brainstorming/planning/TDD discipline, Codex implementation, review repair, and PR publication.
 
 Core principle: do not write product code until proposal, specs, design, and tasks have each been created, reviewed, and repaired.
 
@@ -35,20 +35,22 @@ Before starting work, read:
 | --- | --- |
 | Intake | Read user request or GitHub issue; identify feature vs bugfix. |
 | Branch | Create `codex/feature-<slug>` or `codex/bugfix-<slug>`. |
-| OpenSpec setup | Ensure OpenSpec exists; initialize or update guidance. |
-| Artifacts | Create `proposal.md`, delta `specs/`, `design.md`, and `tasks.md`. |
+| OpenSpec setup | Use `openspec --version`, `openspec init --tools codex .`, and `openspec update`. |
+| Change | Use `openspec new change <name>` and `openspec status --change <name>`. |
+| Artifacts | Use `openspec instructions <artifact> --change <name>` before writing each artifact. |
 | Proposal/spec review | Review proposal and specs, then fix all findings. |
 | Design review | Improve design, review it, then fix all findings. |
 | Task plan | Use writing-plans; review tasks for traceability and TDD slices. |
 | Implementation | Use TDD task by task; keep `tasks.md` checkboxes current. |
-| Review repair | Run code review, fix findings, rerun tests/review checks. |
+| Review repair | Run `openspec validate <name> --type change --strict --no-interactive`, code review, and tests. |
 | PR | Push branch and open PR with artifact links, test evidence, and review summary. |
 
 ## Common Mistakes
 
 | Mistake | Fix |
 | --- | --- |
-| Using `/opsx:propose` and immediately coding | Stop after artifacts; run the proposal/spec/design/task review loops first. |
+| Using slash commands and immediately coding | Stop after artifacts; run the proposal/spec/design/task review loops first. |
+| Creating OpenSpec files from memory | Run `openspec instructions <artifact> --change <name>` and follow the CLI output. |
 | Treating `tasks.md` as a vague checklist | Rewrite tasks into TDD-sized, verifiable slices. |
 | Reviewing only code | Review artifacts before code and OpenSpec compliance after code. |
 | Losing GitHub issue context | Link the issue in proposal and PR; carry acceptance criteria into specs and tasks. |

@@ -4,6 +4,8 @@ Each capability spec requires one independent review file.
 
 Spec reviews may be delegated to independent reviewer agents. The reviewer agent must not author or edit the spec under review.
 
+The review file itself must be written in Chinese, except for literal identifiers, commands, paths, and field names that must remain unchanged.
+
 Spec path:
 
 ```text
@@ -39,12 +41,15 @@ Decision: Changes Requested
 
 - [ ] Covers linked GitHub issue acceptance criteria.
 - [ ] Covers Project item scope.
+- [ ] The review file is written in Chinese, except for literal identifiers or commands that must remain unchanged.
+- [ ] Material assumptions and invariants are stated explicitly.
 - [ ] Requirements describe observable behavior.
 - [ ] Every requirement has at least one `#### Scenario:`.
 - [ ] Scenarios are testable.
 - [ ] Failure and edge cases are covered.
 - [ ] Security, privacy, and permission behavior are explicit when relevant.
 - [ ] Compatibility, migration, removal, or rename behavior is explicit when relevant.
+- [ ] No speculative flexibility, future-facing scope, or over-engineered requirement appears.
 - [ ] No conflict with existing canonical specs.
 - [ ] No ambiguous wording remains.
 

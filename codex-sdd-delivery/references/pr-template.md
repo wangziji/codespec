@@ -23,6 +23,7 @@ Use this as the body for SDD delivery pull requests.
 - Tasks review: Approved
 - Implementation skill gate: `superpowers:subagent-driven-development`
 - Code review skill gate: `code-review-and-quality`
+- Documentation language gate: Chinese for proposal, specs, design, tasks, review artifacts, and PR evidence, except for literal identifiers or commands that must remain unchanged
 - OpenSpec validation: `openspec validate <change-name> --type change --strict --no-interactive`
 - CodeGraph status: `codegraph status .`
 

@@ -29,6 +29,7 @@ Gate:
 - CodeGraph CLI is available.
 - CodeGraph is initialized and `codegraph status .` reports the index is up to date. If not, run `codegraph init -i .` before continuing.
 - Worktree state is understood and unrelated user changes are not touched.
+- Assumptions, constraints, and verification expectations for the selected work are recorded before artifact authoring begins.
 
 ## 1. Select Work From GitHub Project
 
@@ -51,6 +52,7 @@ Gate:
 - Exactly one Project item is selected.
 - Item priority, status, dependencies, and acceptance criteria are understood.
 - If no issue exists, create or request one before OpenSpec work.
+- If multiple valid interpretations remain, they are surfaced and resolved or recorded as blockers.
 
 ## 2. Align GitHub Issue
 
@@ -73,6 +75,7 @@ Gate:
 - Issue links to the Project item.
 - Existing code context has been discovered with CodeGraph when the issue affects code.
 - Ambiguities are resolved or recorded as blocking questions.
+- A simplest-viable implementation direction is identified before proposal writing starts.
 
 ## 3. Create Branch
 
@@ -139,6 +142,9 @@ Gate:
 - Proposal links Project item and issue.
 - Proposal references CodeGraph-discovered existing code boundaries when code changes are expected.
 - `superpowers:brainstorming` was used to refine the proposal before review.
+- `proposal.md` is written in Chinese, except for literal identifiers or commands that must remain unchanged.
+- Proposal states key assumptions, scope boundaries, and explicit out-of-scope items.
+- Proposal prefers the smallest change set that can satisfy the issue.
 - Independent proposal review is recorded and approved before specs begin.
 
 ## 6. Specs Gate
@@ -163,6 +169,9 @@ Gate:
 
 - Every capability has `openspec/changes/<change-name>/specs/<capability>/spec.md`.
 - `superpowers:brainstorming` was used to refine every capability spec before review.
+- Every `spec.md` is written in Chinese, except for literal identifiers or commands that must remain unchanged.
+- Every `spec.md` records assumptions or invariants that materially affect behavior.
+- Specs avoid speculative options, future-facing flexibility, or requirements not requested by the issue or proposal.
 - Every capability has `openspec/changes/<change-name>/reviews/specs/<capability>.review.md`.
 - Every spec review has `Decision: Approved`.
 - Spec reviewer agents did not author or modify the reviewed specs.
@@ -193,6 +202,9 @@ Gate:
 - Design explains architecture, data flow, boundaries, error handling, migration, rollout, observability, and test strategy when relevant.
 - Design uses CodeGraph evidence for existing code boundaries, caller/callee relationships, and impact radius when code changes are expected.
 - `superpowers:brainstorming` was used to refine the design before review.
+- `design.md` is written in Chinese, except for literal identifiers or commands that must remain unchanged.
+- Design documents the chosen simplest viable approach and names rejected higher-complexity options when that tradeoff matters.
+- Design keeps changes surgical by mapping affected modules and explicitly excluding unrelated refactors.
 - Independent design review is approved before tasks begin.
 
 ## 8. Tasks Gate
@@ -218,6 +230,9 @@ Gate:
 - Tasks are ordered, test-first, and traceable to specs/design.
 - Tasks identify likely implementation files and affected tests using CodeGraph when code changes are expected.
 - `superpowers:writing-plans` was used to produce or refine the implementation plan.
+- `tasks.md` is written in Chinese, except for literal identifiers or commands that must remain unchanged.
+- Each non-trivial task includes an explicit verification target, such as a failing test, passing test, validation command, review check, or observable artifact.
+- Tasks avoid speculative cleanup or unrelated improvement work.
 - Independent tasks review is approved.
 - OpenSpec strict validation passes before implementation.
 
@@ -243,6 +258,9 @@ Gate:
 - Implementation plan execution uses `superpowers:subagent-driven-development` with fresh implementer and reviewer subagents.
 - Each task starts with a failing test when behavior changes.
 - Code lookup, symbol search, caller/callee discovery, impact analysis, and affected-test discovery use CodeGraph before raw grep/find/read sweeps.
+- Implementers state assumptions that affect behavior before coding or before changing the plan.
+- Implementation chooses the minimum code path that satisfies the approved artifacts.
+- File edits remain surgical and directly trace to the active task.
 - RED failure is verified before implementation.
 - GREEN pass is verified after implementation.
 - `tasks.md` checkboxes are updated only with evidence.
@@ -293,6 +311,8 @@ Gate:
 - `code-review-and-quality` was used before merge readiness is claimed.
 - Review findings are listed by severity.
 - Code review uses CodeGraph impact/caller/callee queries for code-changing work.
+- Review findings and merge-readiness notes for this workflow are written in Chinese, except for literal identifiers or commands that must remain unchanged.
+- Code review explicitly checks for unnecessary complexity, hidden assumptions, unrelated edits, and missing verification evidence.
 - Required findings are fixed.
 - CI checks pass.
 - OpenSpec artifacts are updated if implementation changes behavior.

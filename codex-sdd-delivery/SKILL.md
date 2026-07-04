@@ -18,6 +18,28 @@ These skills are hard gates. Do not skip, substitute, collapse, or treat them as
 - Implementation gate MUST use `superpowers:subagent-driven-development`.
 - Code review gate MUST use `code-review-and-quality`.
 
+## Required Document Language
+
+All workflow documents MUST be written in Chinese. Do not switch the narrative language to English.
+
+- `proposal.md` MUST be written in Chinese.
+- Every capability `spec.md` MUST be written in Chinese.
+- `design.md` MUST be written in Chinese.
+- `tasks.md` MUST be written in Chinese.
+- Review artifacts such as `reviews/specs/*.review.md` MUST be written in Chinese.
+- PR evidence and review summaries for this workflow MUST be written in Chinese.
+
+Literal code, shell commands, configuration keys, protocol names, API field names, and other identifiers may remain in their original language when translation would reduce accuracy.
+
+## Required Execution Discipline
+
+These rules are hard gates. Treat them as workflow constraints, not style advice.
+
+- Think before coding: state assumptions explicitly, surface meaningful tradeoffs, and stop for clarification when ambiguity would change scope or behavior.
+- Simplicity first: choose the minimum solution that satisfies the approved proposal, specs, design, and tasks. Do not add speculative flexibility, extra features, or single-use abstractions.
+- Surgical changes: touch only files and lines that trace directly to the requested outcome. Remove only the dead code or imports created by your own change.
+- Goal-driven execution: define a concrete verification target for every non-trivial step, then loop until the target is checked with tests, validation, review, or other direct evidence.
+
 ## Required Reading
 
 Before starting work, read these files in order:
@@ -58,6 +80,11 @@ Stop and repair before continuing when:
 - Tasks work proceeds without `superpowers:writing-plans`.
 - Implementation proceeds without `superpowers:subagent-driven-development`.
 - Code review proceeds without `code-review-and-quality`.
+- Any required workflow document is written primarily in English instead of Chinese.
+- Assumptions that affect behavior, scope, or interface are left implicit.
+- The chosen solution is more complex than required by the approved artifacts.
+- Changes spill into unrelated files, formatting, refactors, or cleanup outside the requested scope.
+- A non-trivial phase proceeds without explicit verification goals or without recorded verification evidence.
 - Any proposal, spec, design, tasks, validation, implementation, review, or PR gate fails.
 - Any spec review is missing or not approved.
 - A reviewer agent edits the reviewed artifact or approves its own work.

@@ -30,6 +30,8 @@ Every reviewer agent must receive:
 - Current branch name.
 - OpenSpec change path.
 - Artifact path under review.
+- The document language rule: workflow artifacts and review outputs must be written in Chinese, except for literal identifiers, commands, paths, and field names that must remain unchanged.
+- The execution discipline rules: assumptions must be explicit, solutions must stay as simple as possible, edits must stay surgical, and non-trivial work must include concrete verification evidence.
 - Relevant upstream artifacts, such as proposal before spec review, approved specs before design review, and approved design before tasks review.
 - Existing canonical specs or implementation files when compatibility matters.
 
@@ -44,7 +46,7 @@ Decision: Approved
 
 `Decision: Changes Requested` must include concrete findings with file paths, artifact sections, or requirement/scenario names.
 
-`Decision: Approved` means the reviewer found no blocking issues against the linked Project item, issue, upstream artifacts, and gate checklist.
+`Decision: Approved` means the reviewer found no blocking issues against the linked Project item, issue, upstream artifacts, gate checklist, assumption handling, simplicity, scope discipline, and verification evidence.
 
 ## Delegation Pattern
 
@@ -54,6 +56,7 @@ When sub-agents are available, dispatch bounded review tasks:
 Review <artifact-path> against <source-inputs>. Do not edit files.
 Return Decision: Approved or Decision: Changes Requested with concrete findings.
 For spec review, write or update only reviews/specs/<capability>.review.md if write access is explicitly part of the task.
+Check for hidden assumptions, unnecessary complexity, unrelated edits, and missing verification evidence.
 ```
 
 If sub-agents are not available, simulate independence by starting a fresh review pass from the source artifacts and record that the review was performed in-session.
@@ -63,6 +66,8 @@ If sub-agents are not available, simulate independence by starting a fresh revie
 Stop the workflow when:
 
 - The reviewer did not receive the Project item, issue, OpenSpec change path, or artifact path.
+- The reviewer did not check whether the artifact language is Chinese.
+- The reviewer did not check assumptions, simplicity, surgical scope, or verification evidence.
 - The reviewer modifies the artifact under review.
 - Review output lacks a decision.
 - A required finding is unresolved.
