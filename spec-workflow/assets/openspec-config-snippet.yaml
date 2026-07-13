@@ -1,0 +1,33 @@
+schema: spec-driven
+
+context: |
+  本仓库使用 OpenSpec 管理 change lifecycle，并使用 Superpowers 约束 authoring 与 implementation discipline。
+  UI artifacts 位于 openspec/changes/<change>/artifacts/。
+
+rules:
+  proposal:
+    - 必须由 superpowers:brainstorming 产出。
+    - 必须包含 marker '<!-- spec-workflow: superpowers=brainstorming -->'。
+    - 必须包含 Goals、Non-goals、Impact 和 Open Questions。
+
+  design:
+    - 必须由 superpowers:brainstorming 产出。
+    - 必须包含 marker '<!-- spec-workflow: superpowers=brainstorming -->'。
+    - 必须包含 Technical Design。
+    - Major UI changes 必须包含 UI / UX Design、prototype、Penpot handoff 和 design review。
+
+  tasks:
+    - 必须由 superpowers:writing-plans 产出。
+    - 必须包含 marker '<!-- spec-workflow: superpowers=writing-plans -->'。
+    - UI changes 的 design review tasks 必须出现在 implementation tasks 之前。
+    - UI changes 必须包含 visual validation。
+
+  implementation:
+    - Implementation orchestration 必须使用 superpowers:subagent-driven-development。
+    - 行为变更代码必须使用 superpowers:test-driven-development。
+    - 必须在 artifacts/superpowers/subagent-implementation.md 中记录 implementation evidence。
+    - 必须在 artifacts/superpowers/tdd-log.md 中记录 TDD evidence。
+
+  review:
+    - Merge readiness 前必须运行 code-review-and-quality。
+    - 必须在 artifacts/code-review.md 中记录 review evidence。

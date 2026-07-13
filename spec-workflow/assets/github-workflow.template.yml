@@ -1,0 +1,25 @@
+name: Spec Workflow 门禁
+
+on:
+  pull_request:
+
+jobs:
+  spec-workflow-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 运行 spec workflow gate
+        run: |
+          if [ -f "$HOME/.agents/skills/spec-workflow/scripts/osdd.py" ]; then
+            python3 "$HOME/.agents/skills/spec-workflow/scripts/osdd.py" gate --changed --phase ci
+          elif [ -f ".github/spec-workflow/osdd.py" ]; then
+            python3 ".github/spec-workflow/osdd.py" gate --changed --phase ci
+          elif [ -f ".agents/skills/spec-workflow/scripts/osdd.py" ]; then
+            python3 ".agents/skills/spec-workflow/scripts/osdd.py" gate --changed --phase ci
+          else
+            echo "未找到 spec-workflow osdd.py"
+            exit 1
+          fi

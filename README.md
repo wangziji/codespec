@@ -10,6 +10,7 @@ Skill directories:
 
 - `codex-sdd-delivery/` - recommended Project-first workflow
 - `codex-openspec-superpowers-github/` - narrower issue/change workflow
+- `spec-workflow/` - lower-level OpenSpec/Superpowers gate runtime
 
 ## Recommended Workflow
 
@@ -49,6 +50,7 @@ Recommended: from a local checkout of this repo, copy the skill directories into
 mkdir -p ~/.skills
 rsync -a ./codex-sdd-delivery/ ~/.skills/codex-sdd-delivery/
 rsync -a ./codex-openspec-superpowers-github/ ~/.skills/codex-openspec-superpowers-github/
+rsync -a ./spec-workflow/ ~/.skills/spec-workflow/
 ```
 
 If you only want the recommended Project-first workflow:
@@ -72,6 +74,9 @@ For the older issue/change workflow:
 
 Then follow the workflow gates in:
 
+- `spec-workflow/SKILL.md`
+- `spec-workflow/references/workflow.md`
+- `spec-workflow/references/gates.md`
 - `codex-sdd-delivery/SKILL.md`
 - `codex-sdd-delivery/references/workflow.md`
 - `codex-sdd-delivery/references/artifact-gates.md`

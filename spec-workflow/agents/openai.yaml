@@ -1,0 +1,4 @@
+interface:
+  display_name: "Spec Workflow"
+  short_description: "OpenSpec 与 Superpowers 自动编排门禁"
+  default_prompt: "使用 $spec-workflow 自动推进一个 OpenSpec change；Codex 自己执行流程，只在真人审批点询问我。"
