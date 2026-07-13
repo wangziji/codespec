@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -106,6 +107,14 @@ def read_text(path: Path) -> str:
 def write_file_if_missing(path: Path, content: str) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
+        return False
+    path.write_text(content, encoding="utf-8")
+    return True
+
+
+def write_file_if_changed(path: Path, content: str) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if read_text(path) == content:
         return False
     path.write_text(content, encoding="utf-8")
     return True
@@ -810,10 +819,20 @@ def init_repo_files(repo: Path) -> tuple[list[str], list[str]]:
     targets = {
         repo / ".github" / "workflows" / "spec-workflow-gate.yml": read_text(find_skill_root() / "assets" / "github-workflow.template.yml"),
         repo / ".github" / "codex" / "prompts" / "spec-workflow-review.md": read_text(find_skill_root() / "assets" / "codex-review-prompt.template.md"),
-        repo / ".github" / "spec-workflow" / "osdd.py": read_text(Path(__file__).resolve()),
     }
     for path, content in targets.items():
         if write_file_if_missing(path, content):
+            created.append(str(path.relative_to(repo)))
+        else:
+            skipped.append(str(path.relative_to(repo)))
+
+    runtime_bytes = Path(__file__).resolve().read_bytes()
+    runtime_targets = {
+        repo / ".github" / "spec-workflow" / "osdd.py": runtime_bytes.decode("utf-8"),
+        repo / ".github" / "spec-workflow" / "osdd.sha256": hashlib.sha256(runtime_bytes).hexdigest() + "\n",
+    }
+    for path, content in runtime_targets.items():
+        if write_file_if_changed(path, content):
             created.append(str(path.relative_to(repo)))
         else:
             skipped.append(str(path.relative_to(repo)))
@@ -1105,6 +1124,18 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         )
         autopilot_routes_to_assistant = bool(auto_payload.get("assistant_actions")) and auto_payload.get("human_actions") == []
         autopilot_keeps_evidence_pending = "status: pending" in read_text(auto_change_dir / "artifacts" / "workflow-commands.md")
+        vendored_runtime = root / ".github" / "spec-workflow" / "osdd.py"
+        vendored_digest = root / ".github" / "spec-workflow" / "osdd.sha256"
+        runtime_bytes = Path(__file__).resolve().read_bytes()
+        runtime_digest = hashlib.sha256(runtime_bytes).hexdigest()
+        autopilot_created_vendor_digest = read_text(vendored_digest).strip() == runtime_digest
+        vendored_runtime.write_text("# stale runtime\n", encoding="utf-8")
+        vendored_digest.write_text("stale-digest\n", encoding="utf-8")
+        init_repo_files(root)
+        init_refreshed_vendor_pair = (
+            vendored_runtime.read_bytes() == runtime_bytes
+            and read_text(vendored_digest).strip() == runtime_digest
+        )
         change_dir = find_change_dir("sample-change", root)
         (change_dir / "artifacts" / "superpowers").mkdir(parents=True, exist_ok=True)
         for asset, rel in (
@@ -1201,6 +1232,8 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             and autopilot_created_scaffold
             and autopilot_routes_to_assistant
             and autopilot_keeps_evidence_pending
+            and autopilot_created_vendor_digest
+            and init_refreshed_vendor_pair
             and autopilot_requests_human_design_review
         )
         result = CheckResult(ok=ok, data={
@@ -1220,6 +1253,8 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             "autopilot_created_scaffold": autopilot_created_scaffold,
             "autopilot_routes_to_assistant": autopilot_routes_to_assistant,
             "autopilot_keeps_evidence_pending": autopilot_keeps_evidence_pending,
+            "autopilot_created_vendor_digest": autopilot_created_vendor_digest,
+            "init_refreshed_vendor_pair": init_refreshed_vendor_pair,
             "autopilot_requests_human_design_review": autopilot_requests_human_design_review,
             "tmp": tmp,
         })
@@ -1231,6 +1266,10 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             result.fail("CI change detection treated an archived move as an active change")
         if not governance_tests_not_production:
             result.fail("CI gate treated spec-workflow governance tests as production files")
+        if not autopilot_created_vendor_digest:
+            result.fail("autopilot did not create the vendored runtime digest")
+        if not init_refreshed_vendor_pair:
+            result.fail("init did not atomically refresh the vendored runtime and digest")
         if not ok:
             result.errors.extend(marker_only_audit.errors + pass_planning.errors + before.errors + after.errors + production_without_change.errors + penpot_major.errors + blocking_review.errors)
         return emit(result, args, "selftest")
