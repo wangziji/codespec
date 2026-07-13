@@ -635,7 +635,7 @@ def check_after_apply_gate(change_dir: Path) -> CheckResult:
     return result
 
 
-def changed_open_spec_changes(changed_files: list[str]) -> list[str]:
+def changed_open_spec_changes(changed_files: list[str], repo_root: Path | None = None) -> list[str]:
     names: set[str] = set()
     for file in changed_files:
         parts = Path(file).parts
@@ -644,6 +644,11 @@ def changed_open_spec_changes(changed_files: list[str]) -> list[str]:
         change_name = parts[2]
         if change_name == "archive":
             continue
+        if repo_root is not None and not (repo_root / "openspec" / "changes" / change_name).exists():
+            archive_root = repo_root / "openspec" / "changes" / "archive"
+            relative_path = Path(*parts[3:])
+            if any((path / relative_path).exists() for path in archive_root.glob(f"????-??-??-{change_name}")):
+                continue
         names.add(change_name)
     return sorted(names)
 
@@ -663,7 +668,7 @@ def production_changed_files(changed_files: list[str]) -> list[str]:
 
 def check_ci_gate(repo_root: Path, changed_files: list[str], explicit_change: str | None = None) -> CheckResult:
     result = CheckResult(data={"phase": "ci", "changed_files": changed_files})
-    changes = [explicit_change] if explicit_change else changed_open_spec_changes(changed_files)
+    changes = [explicit_change] if explicit_change else changed_open_spec_changes(changed_files, repo_root)
     production_files = production_changed_files(changed_files)
     if not changes and (production_files or any(UI_HINT_RE.search(f) for f in changed_files)):
         result.fail("business or UI files changed without an associated openspec/changes/<change>/ entry")
@@ -1150,6 +1155,15 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             "openspec/changes/archive/2026-07-11-example/artifacts/validation.md",
         ]
         archive_paths_ignored = changed_open_spec_changes(archive_paths) == []
+        archived_change_dir = root / "openspec" / "changes" / "archive" / "2026-07-13-archived-change"
+        archived_change_dir.mkdir(parents=True, exist_ok=True)
+        archive_move_paths = [
+            "openspec/changes/archived-change/proposal.md",
+            "openspec/changes/archive/2026-07-13-archived-change/proposal.md",
+        ]
+        incomplete_archive_move_detected = changed_open_spec_changes(archive_move_paths, root) == ["archived-change"]
+        (archived_change_dir / "proposal.md").write_text("# Archived\n", encoding="utf-8")
+        archive_moves_ignored = changed_open_spec_changes(archive_move_paths, root) == []
         governance_tests_not_production = production_changed_files(["tests/test_spec_workflow_gate.py"]) == []
         penpot_text = read_text(change_dir / "artifacts" / "penpot.md")
         (change_dir / "artifacts" / "penpot.md").write_text(penpot_text.replace("status: import-ready", "status: not-applicable"), encoding="utf-8")
@@ -1179,6 +1193,8 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             and (not after.ok)
             and (not production_without_change.ok)
             and archive_paths_ignored
+            and incomplete_archive_move_detected
+            and archive_moves_ignored
             and governance_tests_not_production
             and (not penpot_major.ok)
             and (not blocking_review.ok)
@@ -1196,6 +1212,8 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             "after_apply_missing_tdd_or_review_failed": not after.ok,
             "ci_production_without_change_failed": not production_without_change.ok,
             "ci_archive_paths_ignored": archive_paths_ignored,
+            "ci_incomplete_archive_move_detected": incomplete_archive_move_detected,
+            "ci_archive_moves_ignored": archive_moves_ignored,
             "gate_governance_tests_not_production": governance_tests_not_production,
             "major_ui_penpot_not_applicable_failed": not penpot_major.ok,
             "blocking_code_review_failed": not blocking_review.ok,
@@ -1207,6 +1225,10 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         })
         if not archive_paths_ignored:
             result.fail("CI change detection treated archive paths as an active change")
+        if not incomplete_archive_move_detected:
+            result.fail("CI change detection ignored an incomplete archive move")
+        if not archive_moves_ignored:
+            result.fail("CI change detection treated an archived move as an active change")
         if not governance_tests_not_production:
             result.fail("CI gate treated spec-workflow governance tests as production files")
         if not ok:
