@@ -37,6 +37,9 @@ BUSINESS_EXTENSIONS = {
     ".vue", ".svelte", ".rb", ".php", ".rs", ".cs", ".sql",
 }
 UI_HINT_RE = re.compile(r"(frontend|src/.+\.(tsx|jsx|vue|svelte|css|scss)$|app/.+\.(tsx|jsx)$|pages/.+\.(tsx|jsx)$|components/)", re.I)
+GOVERNANCE_TEST_FILES = {
+    "tests/test_spec_workflow_gate.py",
+}
 
 
 @dataclass
@@ -539,11 +542,15 @@ def penpot_not_applicable_reason(change_dir: Path) -> bool:
     return any(pattern in tasks or pattern in penpot for pattern in patterns)
 
 
-def check_before_apply_gate(change_dir: Path, repo_root: Path | None = None) -> CheckResult:
+def check_before_apply_gate(change_dir: Path, repo_root: Path | None = None, require_local_tools: bool = True) -> CheckResult:
     repo_root = repo_root or find_repo_root()
     result = check_planning_gate(change_dir)
     result.data["phase"] = "before-apply"
-    found = check_superpowers_skills(result, ["subagent-driven-development", "test-driven-development"])
+    found = (
+        check_superpowers_skills(result, ["subagent-driven-development", "test-driven-development"])
+        if require_local_tools
+        else detect_superpowers()
+    )
     result.data["superpowers"] = found
     if not (change_dir / "artifacts" / "superpowers" / "subagent-implementation.md").exists():
         result.fail("missing artifacts/superpowers/subagent-implementation.md")
@@ -553,7 +560,7 @@ def check_before_apply_gate(change_dir: Path, repo_root: Path | None = None) -> 
         result.fail(error)
     for error in check_retrieval_evidence(change_dir):
         result.fail(error)
-    if not check_codegraph():
+    if require_local_tools and not check_codegraph():
         result.fail("CodeGraph missing; install/index codegraph or record a supported retrieval setup")
     project_types = detect_project_types(repo_root)
     lsp = check_lsp_for_project_types(project_types)
@@ -645,6 +652,8 @@ def production_changed_files(changed_files: list[str]) -> list[str]:
     result = []
     for file in changed_files:
         path = Path(file)
+        if file in GOVERNANCE_TEST_FILES:
+            continue
         if file.startswith(("openspec/", ".github/", "docs/", "requirements/")):
             continue
         if path.suffix in BUSINESS_EXTENSIONS:
@@ -661,7 +670,7 @@ def check_ci_gate(repo_root: Path, changed_files: list[str], explicit_change: st
         return result
     for change in changes:
         change_dir = find_change_dir(change, repo_root)
-        before = check_before_apply_gate(change_dir, repo_root)
+        before = check_before_apply_gate(change_dir, repo_root, require_local_tools=False)
         after = check_after_apply_gate(change_dir)
         if not before.ok:
             result.fail(f"{change}: before-apply gate failed: {'; '.join(before.errors)}")
@@ -1141,6 +1150,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             "openspec/changes/archive/2026-07-11-example/artifacts/validation.md",
         ]
         archive_paths_ignored = changed_open_spec_changes(archive_paths) == []
+        governance_tests_not_production = production_changed_files(["tests/test_spec_workflow_gate.py"]) == []
         penpot_text = read_text(change_dir / "artifacts" / "penpot.md")
         (change_dir / "artifacts" / "penpot.md").write_text(penpot_text.replace("status: import-ready", "status: not-applicable"), encoding="utf-8")
         penpot_major = check_before_apply_gate(change_dir, root)
@@ -1169,6 +1179,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             and (not after.ok)
             and (not production_without_change.ok)
             and archive_paths_ignored
+            and governance_tests_not_production
             and (not penpot_major.ok)
             and (not blocking_review.ok)
             and autopilot_created_scaffold
@@ -1185,6 +1196,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             "after_apply_missing_tdd_or_review_failed": not after.ok,
             "ci_production_without_change_failed": not production_without_change.ok,
             "ci_archive_paths_ignored": archive_paths_ignored,
+            "gate_governance_tests_not_production": governance_tests_not_production,
             "major_ui_penpot_not_applicable_failed": not penpot_major.ok,
             "blocking_code_review_failed": not blocking_review.ok,
             "autopilot_created_scaffold": autopilot_created_scaffold,
@@ -1195,6 +1207,8 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         })
         if not archive_paths_ignored:
             result.fail("CI change detection treated archive paths as an active change")
+        if not governance_tests_not_production:
+            result.fail("CI gate treated spec-workflow governance tests as production files")
         if not ok:
             result.errors.extend(marker_only_audit.errors + pass_planning.errors + before.errors + after.errors + production_without_change.errors + penpot_major.errors + blocking_review.errors)
         return emit(result, args, "selftest")
