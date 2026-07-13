@@ -539,11 +539,15 @@ def penpot_not_applicable_reason(change_dir: Path) -> bool:
     return any(pattern in tasks or pattern in penpot for pattern in patterns)
 
 
-def check_before_apply_gate(change_dir: Path, repo_root: Path | None = None) -> CheckResult:
+def check_before_apply_gate(change_dir: Path, repo_root: Path | None = None, require_local_tools: bool = True) -> CheckResult:
     repo_root = repo_root or find_repo_root()
     result = check_planning_gate(change_dir)
     result.data["phase"] = "before-apply"
-    found = check_superpowers_skills(result, ["subagent-driven-development", "test-driven-development"])
+    found = (
+        check_superpowers_skills(result, ["subagent-driven-development", "test-driven-development"])
+        if require_local_tools
+        else detect_superpowers()
+    )
     result.data["superpowers"] = found
     if not (change_dir / "artifacts" / "superpowers" / "subagent-implementation.md").exists():
         result.fail("missing artifacts/superpowers/subagent-implementation.md")
@@ -553,7 +557,7 @@ def check_before_apply_gate(change_dir: Path, repo_root: Path | None = None) -> 
         result.fail(error)
     for error in check_retrieval_evidence(change_dir):
         result.fail(error)
-    if not check_codegraph():
+    if require_local_tools and not check_codegraph():
         result.fail("CodeGraph missing; install/index codegraph or record a supported retrieval setup")
     project_types = detect_project_types(repo_root)
     lsp = check_lsp_for_project_types(project_types)
@@ -661,7 +665,7 @@ def check_ci_gate(repo_root: Path, changed_files: list[str], explicit_change: st
         return result
     for change in changes:
         change_dir = find_change_dir(change, repo_root)
-        before = check_before_apply_gate(change_dir, repo_root)
+        before = check_before_apply_gate(change_dir, repo_root, require_local_tools=False)
         after = check_after_apply_gate(change_dir)
         if not before.ok:
             result.fail(f"{change}: before-apply gate failed: {'; '.join(before.errors)}")
