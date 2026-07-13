@@ -12,9 +12,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 PASS = 0
 FAIL = 1
@@ -646,6 +648,7 @@ def check_after_apply_gate(change_dir: Path) -> CheckResult:
 
 def changed_open_spec_changes(changed_files: list[str], repo_root: Path | None = None) -> list[str]:
     names: set[str] = set()
+    archive_dirs_by_change: dict[str, tuple[Path, ...]] = {}
     for file in changed_files:
         parts = Path(file).parts
         if len(parts) < 4 or parts[0:2] != ("openspec", "changes"):
@@ -656,7 +659,9 @@ def changed_open_spec_changes(changed_files: list[str], repo_root: Path | None =
         if repo_root is not None and not (repo_root / "openspec" / "changes" / change_name).exists():
             archive_root = repo_root / "openspec" / "changes" / "archive"
             relative_path = Path(*parts[3:])
-            if any((path / relative_path).exists() for path in archive_root.glob(f"????-??-??-{change_name}")):
+            if change_name not in archive_dirs_by_change:
+                archive_dirs_by_change[change_name] = tuple(archive_root.glob(f"????-??-??-{change_name}"))
+            if any((path / relative_path).exists() for path in archive_dirs_by_change[change_name]):
                 continue
         names.add(change_name)
     return sorted(names)
@@ -1195,6 +1200,24 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         incomplete_archive_move_detected = changed_open_spec_changes(archive_move_paths, root) == ["archived-change"]
         (archived_change_dir / "proposal.md").write_text("# Archived\n", encoding="utf-8")
         archive_moves_ignored = changed_open_spec_changes(archive_move_paths, root) == []
+        (archived_change_dir / "artifacts").mkdir(parents=True, exist_ok=True)
+        (archived_change_dir / "artifacts" / "validation.md").write_text("test: passed\n", encoding="utf-8")
+        archive_cache_paths = [
+            "openspec/changes/archived-change/proposal.md",
+            "openspec/changes/archived-change/artifacts/validation.md",
+        ]
+        archive_glob_calls = 0
+        original_path_glob = Path.glob
+
+        def counting_glob(path: Path, pattern: str) -> Iterator[Path]:
+            nonlocal archive_glob_calls
+            if path == archived_change_dir.parent:
+                archive_glob_calls += 1
+            return original_path_glob(path, pattern)
+
+        with mock.patch.object(Path, "glob", counting_glob):
+            archive_cache_result = changed_open_spec_changes(archive_cache_paths, root)
+        archive_lookup_cached = archive_cache_result == [] and archive_glob_calls == 1
         governance_tests_not_production = production_changed_files(["tests/test_spec_workflow_gate.py"]) == []
         penpot_text = read_text(change_dir / "artifacts" / "penpot.md")
         (change_dir / "artifacts" / "penpot.md").write_text(penpot_text.replace("status: import-ready", "status: not-applicable"), encoding="utf-8")
@@ -1226,6 +1249,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             and archive_paths_ignored
             and incomplete_archive_move_detected
             and archive_moves_ignored
+            and archive_lookup_cached
             and governance_tests_not_production
             and (not penpot_major.ok)
             and (not blocking_review.ok)
@@ -1247,6 +1271,8 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             "ci_archive_paths_ignored": archive_paths_ignored,
             "ci_incomplete_archive_move_detected": incomplete_archive_move_detected,
             "ci_archive_moves_ignored": archive_moves_ignored,
+            "ci_archive_lookup_cached": archive_lookup_cached,
+            "ci_archive_lookup_count": archive_glob_calls,
             "gate_governance_tests_not_production": governance_tests_not_production,
             "major_ui_penpot_not_applicable_failed": not penpot_major.ok,
             "blocking_code_review_failed": not blocking_review.ok,
@@ -1264,6 +1290,8 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             result.fail("CI change detection ignored an incomplete archive move")
         if not archive_moves_ignored:
             result.fail("CI change detection treated an archived move as an active change")
+        if not archive_lookup_cached:
+            result.fail(f"CI change detection scanned the same archive more than once: {archive_glob_calls}")
         if not governance_tests_not_production:
             result.fail("CI gate treated spec-workflow governance tests as production files")
         if not autopilot_created_vendor_digest:
