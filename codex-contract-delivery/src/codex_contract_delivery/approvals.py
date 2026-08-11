@@ -56,14 +56,15 @@ class ApprovalRecord:
     canary_digest: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.actor or not self.role:
-            raise ValueError("actor and role must be non-empty")
-        if self.decision not in {"approved", "rejected"}:
+        for name, value in (("approval_id", self.approval_id), ("actor", self.actor), ("role", self.role)):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string")
+        if not isinstance(self.decision, str) or self.decision not in {"approved", "rejected"}:
             raise ValueError("decision must be approved or rejected")
-        if self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
+        if not isinstance(self.timestamp, datetime) or self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
             raise ValueError("timestamp must be timezone-qualified RFC3339 time")
         for name, digest in self.dependencies.items():
-            if not re.fullmatch(r"[a-f0-9]{64}", digest):
+            if not isinstance(name, str) or not name or not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
                 raise ValueError(f"{name} digest must be a lowercase SHA-256 hex digest")
 
     @property

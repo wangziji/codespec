@@ -112,11 +112,17 @@ def test_contract_node_does_not_expose_mutable_nested_value() -> None:
 @pytest.mark.parametrize(
     ("change", "message"),
     [
+        ({"approval_id": ""}, "approval_id"),
         ({"actor": ""}, "actor"),
+        ({"actor": 1}, "actor"),
         ({"role": ""}, "role"),
+        ({"role": 1}, "role"),
         ({"decision": "maybe"}, "decision"),
+        ({"decision": 1}, "decision"),
         ({"timestamp": datetime(2026, 8, 11, tzinfo=timezone.utc).replace(tzinfo=None)}, "timestamp"),
+        ({"timestamp": "x"}, "timestamp"),
         ({"baseline_digest": "bad"}, "digest"),
+        ({"baseline_digest": 1}, "digest"),
     ],
 )
 def test_approval_record_rejects_invalid_bound_input(change: dict[str, object], message: str) -> None:
