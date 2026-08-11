@@ -1,7 +1,7 @@
-baseline: baseline
-effective_contract: effective
-penpot: old-digest
-plan: plan
-workflow_release: workflow
-release: new-release
-canary: canary
+baseline: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+effective_contract: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+penpot: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+plan: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+workflow_release: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+release: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+canary: '0000000000000000000000000000000000000000000000000000000000000000'

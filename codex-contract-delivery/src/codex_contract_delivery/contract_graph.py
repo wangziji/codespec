@@ -18,15 +18,19 @@ from .models import Finding, OwnerRef
 from .schema import SchemaRegistry
 
 _SCENARIO_HEADING = re.compile(r"^##\s+(R-[A-Za-z0-9_-]+)\s*$", re.MULTILINE)
-_FORBIDDEN_DELTA_KEYS = frozenset(
-    {"goal", "goals", "scenario", "scenarios", "api", "apis", "api_definition", "api_definitions", "data_definition", "data_definitions", "data_model", "data_models"}
-)
 _DELIVERY_SECTIONS = (
     "cross_layer_impacts",
     "environment_obligations",
     "verification",
     "completion_conditions",
 )
+_SECTION_FIELDS = {
+    "delta_operations": frozenset({"id", "kind", "action", "target_ref", "scenario_refs", "summary"}),
+    "cross_layer_impacts": frozenset({"id", "kind", "source_ref", "target_ref", "summary"}),
+    "environment_obligations": frozenset({"id", "kind", "target_ref", "condition"}),
+    "verification": frozenset({"id", "kind", "target_ref", "condition"}),
+    "completion_conditions": frozenset({"id", "kind", "target_ref", "condition"}),
+}
 
 
 class ContractResolutionError(ValueError):
@@ -150,7 +154,7 @@ class ContractGraph:
         path = self._safe_input_path(root, root / owner.path)
         if self._is_generated(root, path):
             raise ContractResolutionError((Finding("CDD-GRAPH-GENERATED-INPUT", "Generated artifacts cannot be authoritative contract inputs.", owner.path),))
-        if owner.kind != "product" or path.name != "PRODUCT.md":
+        if owner.kind != "product":
             raise ContractResolutionError((Finding("CDD-GRAPH-OWNER-UNSUPPORTED", "Unsupported owner reference.", owner.path),))
         try:
             metadata, body = load_markdown_frontmatter(path)
@@ -180,13 +184,12 @@ class ContractGraph:
         for operation in operations:
             if not isinstance(operation, Mapping) or not isinstance(operation.get("id"), str) or not isinstance(operation.get("kind"), str):
                 raise ContractResolutionError((Finding("CDD-GRAPH-INVALID-DELTA", "Delta must have string id and kind.", "delta_operations"),))
+            self._validate_section_item("delta_operations", operation)
             action = operation.get("action", "add")
             if action in {"delete", "remove", "weaken"}:
                 raise ContractResolutionError((Finding("CDD-GRAPH-CHILD-WEAKENING", "Delivery deltas cannot weaken or delete baseline constraints.", f"delta_operations.{operation['id']}"),))
             if action != "add":
                 raise ContractResolutionError((Finding("CDD-GRAPH-INVALID-DELTA", "Only additive delivery deltas are supported.", f"delta_operations.{operation['id']}"),))
-            if self._contains_forbidden_owner_fact(operation):
-                raise ContractResolutionError((Finding("CDD-GRAPH-COPIED-OWNER-FACT", "Delta contains copied owner facts.", f"delta_operations.{operation['id']}"),))
             self._add_node(nodes, origins, f"delta:{operation['id']}", operation, origin)
 
     def _add_delivery_section(
@@ -203,21 +206,22 @@ class ContractGraph:
             raise ContractResolutionError((Finding("CDD-GRAPH-UNEXPLAINABLE-PAYLOAD", "Delivery section must be a list.", section),))
         origin = self._relative(root, delivery_path)
         for item in items:
-            if not isinstance(item, Mapping) or not isinstance(item.get("id"), str) or not item["id"]:
-                raise ContractResolutionError((Finding("CDD-GRAPH-UNEXPLAINABLE-PAYLOAD", "Delivery items require a stable string id.", section),))
+            self._validate_section_item(section, item)
             self._add_node(nodes, origins, f"delivery:{section}:{item['id']}", item, origin)
 
     @staticmethod
-    def _contains_forbidden_owner_fact(value: object) -> bool:
-        if isinstance(value, Mapping):
-            return any(
-                str(key).lower().replace("-", "_") in _FORBIDDEN_DELTA_KEYS
-                or ContractGraph._contains_forbidden_owner_fact(item)
-                for key, item in value.items()
-            )
-        if isinstance(value, list | tuple):
-            return any(ContractGraph._contains_forbidden_owner_fact(item) for item in value)
-        return False
+    def _validate_section_item(section: str, item: object) -> None:
+        if not isinstance(item, Mapping) or not isinstance(item.get("id"), str) or not item["id"]:
+            raise ContractResolutionError((Finding("CDD-GRAPH-UNEXPLAINABLE-PAYLOAD", "Delivery items require a stable string id.", section),))
+        allowed = _SECTION_FIELDS[section]
+        if set(item) - allowed:
+            raise ContractResolutionError((Finding("CDD-GRAPH-UNEXPLAINABLE-PAYLOAD", "Delivery item contains an unknown field.", section),))
+        for key, value in item.items():
+            if key == "scenario_refs":
+                if not isinstance(value, list) or not all(isinstance(ref, str) and ref for ref in value):
+                    raise ContractResolutionError((Finding("CDD-GRAPH-UNEXPLAINABLE-PAYLOAD", "Scenario references must be non-empty strings.", section),))
+            elif not isinstance(value, str) or not value:
+                raise ContractResolutionError((Finding("CDD-GRAPH-UNEXPLAINABLE-PAYLOAD", "Delivery values must be concise scalar text.", section),))
 
     @staticmethod
     def _add_node(
@@ -226,7 +230,7 @@ class ContractGraph:
         frozen = freeze_value(value)
         if not isinstance(frozen, Mapping):
             raise ContractResolutionError((Finding("CDD-GRAPH-UNEXPLAINABLE-PAYLOAD", "Effective nodes must be mappings.", node_id),))
-        if node_id in nodes and nodes[node_id] != frozen:
+        if node_id in nodes and (nodes[node_id] != frozen or origins[node_id] != origin):
             raise ContractResolutionError((Finding("CDD-GRAPH-CONFLICT", "Conflicting values for the same effective node.", node_id),))
         nodes[node_id] = frozen
         origins[node_id] = origin

@@ -4,7 +4,11 @@ import os
 from pathlib import Path
 
 import pytest
-from codex_contract_delivery.canonical import canonical_digest, load_yaml
+from codex_contract_delivery.canonical import (
+    canonical_digest,
+    load_markdown_frontmatter,
+    load_yaml,
+)
 from codex_contract_delivery.contract_graph import (
     ContractGraph,
     ContractResolutionError,
@@ -30,7 +34,7 @@ def _write_valid_project(root: Path) -> None:
         "workflow_release_digest: '" + "a" * 64 + "'\n"
         "owner_refs:\n  - kind: product\n    record_id: trade-wise\n    revision: r1\n"
         f"    digest: '{product_digest}'\n    path: PRODUCT.md\n"
-        "delta_operations:\n  - id: api-login\n    kind: api\n    action: add\n    value: POST /login\n"
+        "delta_operations:\n  - id: api-login\n    kind: api\n    action: add\n    target_ref: api:login\n    summary: Add login endpoint\n"
         "cross_layer_impacts: []\nenvironment_obligations: []\nverification: []\ncompletion_conditions: []\n",
         encoding="utf-8",
     )
@@ -56,8 +60,8 @@ def test_graph_rejects_conflicting_delta_values(valid_project: Path) -> None:
     contract = valid_project / "deliveries" / "D-001" / "contract.yaml"
     contract.write_text(
         contract.read_text(encoding="utf-8").replace(
-            "    value: POST /login\n",
-            "    value: POST /login\n  - id: api-login\n    kind: api\n    action: add\n    value: POST /sessions\n",
+            "    summary: Add login endpoint\n",
+            "    summary: Add login endpoint\n  - id: api-login\n    kind: api\n    action: add\n    target_ref: api:session\n    summary: Add session endpoint\n",
         ),
         encoding="utf-8",
     )
@@ -125,7 +129,7 @@ def test_trace_connects_declared_scenario_to_delta(valid_project: Path) -> None:
     scenario_ref = load_yaml(
         Path(__file__).parents[1] / "fixtures" / "contracts" / "valid" / "scenario-refs.yaml"
     )
-    contract.write_text(contract.read_text(encoding="utf-8").replace("    value: POST /login", f"    scenario_refs: {scenario_ref['scenario_refs']}\n    value: POST /login"), encoding="utf-8")
+    contract.write_text(contract.read_text(encoding="utf-8").replace("    summary: Add login endpoint", f"    scenario_refs: {scenario_ref['scenario_refs']}\n    summary: Add login endpoint"), encoding="utf-8")
 
     graph = ContractGraph()
     graph.resolve(valid_project, "D-001")
@@ -175,12 +179,12 @@ def test_graph_rejects_nested_copied_owner_facts(valid_project: Path) -> None:
     copied = load_yaml(
         Path(__file__).parents[1] / "fixtures" / "contracts" / "conflict" / "nested-copied-fact.yaml"
     )
-    contract.write_text(contract.read_text(encoding="utf-8").replace("    value: POST /login", f"    details: {copied}\n    value: POST /login"), encoding="utf-8")
+    contract.write_text(contract.read_text(encoding="utf-8").replace("    summary: Add login endpoint", f"    details: {copied}\n    summary: Add login endpoint"), encoding="utf-8")
 
     with pytest.raises(ContractResolutionError) as raised:
         ContractGraph().resolve(valid_project, "D-001")
 
-    assert [finding.code for finding in raised.value.findings] == ["CDD-GRAPH-COPIED-OWNER-FACT"]
+    assert [finding.code for finding in raised.value.findings] == ["CDD-GRAPH-UNEXPLAINABLE-PAYLOAD"]
 
 
 def test_graph_rejects_owner_path_traversal(valid_project: Path, tmp_path: Path) -> None:
@@ -230,7 +234,7 @@ def test_graph_rejects_generated_target_behind_owner_symlink(valid_project: Path
 def test_trace_rejects_unknown_scenario_reference(valid_project: Path) -> None:
     """Would fail if a delta could manufacture a trace edge from an unknown scenario."""
     contract = valid_project / "deliveries" / "D-001" / "contract.yaml"
-    contract.write_text(contract.read_text(encoding="utf-8").replace("    value: POST /login", "    scenario_refs: [R-UNKNOWN]\n    value: POST /login"), encoding="utf-8")
+    contract.write_text(contract.read_text(encoding="utf-8").replace("    summary: Add login endpoint", "    scenario_refs: [R-UNKNOWN]\n    summary: Add login endpoint"), encoding="utf-8")
 
     with pytest.raises(ContractResolutionError) as raised:
         ContractGraph().resolve(valid_project, "D-001")
@@ -241,9 +245,52 @@ def test_trace_rejects_unknown_scenario_reference(valid_project: Path) -> None:
 def test_effective_graph_is_deeply_immutable(valid_project: Path) -> None:
     """Would fail if a nested effective node could mutate after its digest was calculated."""
     contract = valid_project / "deliveries" / "D-001" / "contract.yaml"
-    contract.write_text(contract.read_text(encoding="utf-8").replace("    value: POST /login", "    details: {nested: [original]}\n    value: POST /login"), encoding="utf-8")
+    contract.write_text(contract.read_text(encoding="utf-8").replace("    summary: Add login endpoint", "    scenario_refs: [R-LOGIN-01]\n    summary: Add login endpoint"), encoding="utf-8")
 
     effective = ContractGraph().resolve(valid_project, "D-001")
 
     with pytest.raises(TypeError):
-        effective.nodes["delta:api-login"]["details"]["nested"][0] = "changed"  # type: ignore[index]
+        effective.nodes["delta:api-login"]["scenario_refs"][0] = "changed"  # type: ignore[index]
+
+
+@pytest.mark.parametrize("key", ["baseline", "product_id", "revision", "digest", "unknown_field"])
+def test_graph_rejects_delta_allowlist_bypasses(valid_project: Path, key: str) -> None:
+    """Would fail if owner facts or unknown payload keys bypassed delta allow-lists."""
+    contract = valid_project / "deliveries" / "D-001" / "contract.yaml"
+    contract.write_text(contract.read_text(encoding="utf-8").replace("    summary: Add login endpoint", f"    {key}: {{nested: copied}}\n    summary: Add login endpoint"), encoding="utf-8")
+
+    with pytest.raises(ContractResolutionError) as raised:
+        ContractGraph().resolve(valid_project, "D-001")
+
+    assert [finding.code for finding in raised.value.findings] == ["CDD-GRAPH-UNEXPLAINABLE-PAYLOAD"]
+
+
+def test_graph_accepts_minimal_allowlisted_items_in_every_section(valid_project: Path) -> None:
+    """Would fail if valid reference-only records were rejected or omitted from the graph."""
+    contract = valid_project / "deliveries" / "D-001" / "contract.yaml"
+    contract.write_text(contract.read_text(encoding="utf-8").replace(
+        "cross_layer_impacts: []\nenvironment_obligations: []\nverification: []\ncompletion_conditions: []",
+        "cross_layer_impacts: [{id: impact, kind: ui, source_ref: scenario:R-LOGIN-01, target_ref: api:login, summary: linked}]\n"
+        "environment_obligations: [{id: env, kind: redis, target_ref: environment:test, condition: writable}]\n"
+        "verification: [{id: verify, kind: integration, target_ref: api:login, condition: passes}]\n"
+        "completion_conditions: [{id: complete, kind: acceptance, target_ref: scenario:R-LOGIN-01, condition: approved}]",
+    ), encoding="utf-8")
+
+    effective = ContractGraph().resolve(valid_project, "D-001")
+
+    assert {"delta:api-login", "delivery:cross_layer_impacts:impact", "delivery:environment_obligations:env", "delivery:verification:verify", "delivery:completion_conditions:complete"} <= set(effective.nodes)
+
+
+def test_graph_rejects_same_product_from_different_owner_path(valid_project: Path) -> None:
+    """Would fail if an identical node could silently replace its original provenance."""
+    copied = valid_project / "PRODUCT-copy.md"
+    copied.write_text((valid_project / "PRODUCT.md").read_text(encoding="utf-8"), encoding="utf-8")
+    contract = valid_project / "deliveries" / "D-001" / "contract.yaml"
+    metadata, body = load_markdown_frontmatter(copied)
+    digest = canonical_digest({"frontmatter": metadata, "body": body})
+    contract.write_text(contract.read_text(encoding="utf-8").replace("delta_operations:", "  - kind: product\n    record_id: trade-wise\n    revision: r1\n    digest: '" + digest + "'\n    path: PRODUCT-copy.md\ndelta_operations:"), encoding="utf-8")
+
+    with pytest.raises(ContractResolutionError) as raised:
+        ContractGraph().resolve(valid_project, "D-001")
+
+    assert [finding.code for finding in raised.value.findings] == ["CDD-GRAPH-CONFLICT"]

@@ -23,13 +23,13 @@ def _record() -> ApprovalRecord:
         role="design",
         decision="approved",
         timestamp=datetime(2026, 8, 11, tzinfo=timezone.utc),
-        baseline_digest="baseline",
-        effective_contract_digest="effective",
-        penpot_digest="old-digest",
-        plan_digest="plan",
-        workflow_release_digest="workflow",
-        release_digest="release",
-        canary_digest="canary",
+        baseline_digest="a" * 64,
+        effective_contract_digest="b" * 64,
+        penpot_digest="c" * 64,
+        plan_digest="d" * 64,
+        workflow_release_digest="e" * 64,
+        release_digest="f" * 64,
+        canary_digest="0" * 64,
     )
 
 
@@ -107,3 +107,31 @@ def test_contract_node_does_not_expose_mutable_nested_value() -> None:
 
     with pytest.raises(TypeError):
         node.value["nested"]["items"][0] = "changed"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"actor": ""}, "actor"),
+        ({"role": ""}, "role"),
+        ({"decision": "maybe"}, "decision"),
+        ({"timestamp": datetime(2026, 8, 11, tzinfo=timezone.utc).replace(tzinfo=None)}, "timestamp"),
+        ({"baseline_digest": "bad"}, "digest"),
+    ],
+)
+def test_approval_record_rejects_invalid_bound_input(change: dict[str, object], message: str) -> None:
+    """Would fail if malformed approval identity or digest bindings were accepted."""
+    values = _record().__dict__ | change
+
+    with pytest.raises(ValueError, match=message):
+        ApprovalRecord(**values)
+
+
+def test_rejected_approval_is_never_valid() -> None:
+    """Would fail if a rejected decision could pass verification with matching inputs."""
+    rejected = ApprovalRecord(**(_record().__dict__ | {"decision": "rejected"}))
+
+    result = ApprovalVerifier().verify(rejected, rejected.dependencies)
+
+    assert result.valid is False
+    assert [finding.code for finding in result.findings] == ["CDD-APPROVAL-REJECTED"]

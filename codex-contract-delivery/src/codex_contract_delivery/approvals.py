@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -54,6 +55,17 @@ class ApprovalRecord:
     release_digest: str | None = None
     canary_digest: str | None = None
 
+    def __post_init__(self) -> None:
+        if not self.actor or not self.role:
+            raise ValueError("actor and role must be non-empty")
+        if self.decision not in {"approved", "rejected"}:
+            raise ValueError("decision must be approved or rejected")
+        if self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
+            raise ValueError("timestamp must be timezone-qualified RFC3339 time")
+        for name, digest in self.dependencies.items():
+            if not re.fullmatch(r"[a-f0-9]{64}", digest):
+                raise ValueError(f"{name} digest must be a lowercase SHA-256 hex digest")
+
     @property
     def dependencies(self) -> Mapping[str, str]:
         values = {
@@ -81,6 +93,8 @@ class ApprovalVerifier:
     """Invalidate an approval whenever any dependency bound by it changes."""
 
     def verify(self, record: ApprovalRecord, dependencies: Mapping[str, str]) -> ApprovalResult:
+        if record.decision == "rejected":
+            return ApprovalResult(False, (), (Finding("CDD-APPROVAL-REJECTED", "Approval decision is rejected.", "decision"),))
         bound = record.dependencies
         missing = sorted(set(bound) - set(dependencies))
         extra = sorted(set(dependencies) - set(bound))
