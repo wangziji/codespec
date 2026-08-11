@@ -8,6 +8,7 @@ from pathlib import Path
 import codex_contract_delivery.journal as journal_module
 import pytest
 from codex_contract_delivery.journal import (
+    ClockRollback,
     DatabaseBusy,
     EffectConflict,
     EffectIntent,
@@ -79,6 +80,16 @@ def request(
 
 def seed_effect(journal: Journal, effect_id: str = "deploy-1") -> None:
     journal.transition(request(effect_id=effect_id))
+
+
+def observed_watermark(path: Path) -> str | None:
+    connection = sqlite3.connect(path)
+    try:
+        return connection.execute(
+            "SELECT last_observed_time FROM journal_metadata WHERE singleton = 1"
+        ).fetchone()[0]
+    finally:
+        connection.close()
 
 
 def create_ba17dca_v0_database(path: Path, *, revision_type: str = "INTEGER") -> None:
@@ -187,6 +198,62 @@ def create_ba17dca_v0_database(path: Path, *, revision_type: str = "INTEGER") ->
     connection.close()
 
 
+def create_round2_v1_database(path: Path, *, conflicting: bool = False) -> None:
+    """Create the exact schema published by round 2 with durable audit data."""
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA foreign_keys = ON")
+    for statement in journal_module._V1_SCHEMA_STATEMENTS:
+        connection.execute(statement)
+    connection.execute("PRAGMA user_version = 1")
+    timestamp = "2026-08-11T00:00:00.000000+00:00"
+    connection.execute(
+        "INSERT INTO runs(run_id, state, revision, updated_at) "
+        "VALUES ('run-1', 'discovery', 1, ?)",
+        (timestamp,),
+    )
+    connection.execute(
+        "INSERT INTO events(run_id, revision, event, state, context_json, created_at) "
+        "VALUES ('run-1', 1, 'DISCOVER', 'discovery', '{}', ?)",
+        (timestamp,),
+    )
+    for effect_id, state, evidence in (
+        ("reconciled-effect", "reconciled", None),
+        ("completed-effect", "completed", "probe://completed"),
+    ):
+        connection.execute(
+            "INSERT INTO effects(run_id, effect_id, kind, state, evidence_ref, created_at, updated_at) "
+            "VALUES ('run-1', ?, 'release', ?, ?, ?, ?)",
+            (effect_id, state, evidence, timestamp, timestamp),
+        )
+    for effect_id, worker_id, fence in (
+        ("reconciled-effect", "worker-a", 7),
+        ("completed-effect", "worker-b", 8),
+    ):
+        connection.execute(
+            "INSERT INTO leases(run_id, effect_id, worker_id, fence, expires_at) "
+            "VALUES ('run-1', ?, ?, ?, ?)",
+            (effect_id, worker_id, fence, timestamp),
+        )
+    connection.execute(
+        "INSERT INTO reconciliations(reconciliation_id, run_id, effect_id, fence, outcome, evidence_ref, observed_at) "
+        "VALUES (41, 'run-1', 'reconciled-effect', 7, 'unknown', 'probe://unknown', ?)",
+        (timestamp,),
+    )
+    connection.execute(
+        "INSERT INTO reconciliations(reconciliation_id, run_id, effect_id, fence, outcome, evidence_ref, observed_at) "
+        "VALUES (44, 'run-1', 'completed-effect', 8, 'observed_completed', 'probe://completed', ?)",
+        (timestamp,),
+    )
+    if conflicting:
+        connection.execute(
+            "INSERT INTO reconciliations(reconciliation_id, run_id, effect_id, fence, outcome, evidence_ref, observed_at) "
+            "VALUES (45, 'run-1', 'reconciled-effect', 7, 'observed_absent', 'probe://absent', ?)",
+            (timestamp,),
+        )
+    connection.commit()
+    connection.close()
+
+
 def rewrite_schema_object(path: Path, kind: str, name: str, sql: str) -> None:
     """Replace one sqlite_master definition to build a same-shape corrupt fixture."""
     connection = sqlite3.connect(path)
@@ -268,6 +335,13 @@ def test_open_is_repeatable_and_enables_sqlite_safety_pragmas(
             )
         }
         assert {"runs", "effects", "leases", "events"} <= tables
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert (
+            connection.execute(
+                "SELECT schema_version FROM journal_metadata WHERE singleton = 1"
+            ).fetchone()[0]
+            == 2
+        )
     finally:
         connection.close()
 
@@ -298,17 +372,67 @@ def test_open_migrates_real_ba17dca_schema_and_preserves_data(
 
     connection = sqlite3.connect(journal_path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
         assert (
             connection.execute(
                 "SELECT schema_version FROM journal_metadata WHERE singleton = 1"
             ).fetchone()[0]
-            == 1
+            == 2
         )
         assert dict(connection.execute("SELECT effect_id, fence FROM leases")) == {
             "started-effect": 7,
             "reconciled-effect": 8,
         }
+    finally:
+        connection.close()
+
+    reopened = Journal.open(journal_path)
+    reopened.close()
+
+
+def test_open_migrates_clean_round2_v1_and_preserves_audit_identity(
+    journal_path: Path,
+) -> None:
+    """Would fail if v1-to-v2 migration changed audit IDs, order, or evidence."""
+    create_round2_v1_database(journal_path)
+
+    migrated = Journal.open(journal_path)
+    migrated.close()
+
+    connection = sqlite3.connect(journal_path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert (
+            connection.execute(
+                "SELECT schema_version FROM journal_metadata WHERE singleton = 1"
+            ).fetchone()[0]
+            == 2
+        )
+        assert connection.execute(
+            "SELECT reconciliation_id, effect_id, fence, outcome, evidence_ref "
+            "FROM reconciliations ORDER BY reconciliation_id"
+        ).fetchall() == [
+            (41, "reconciled-effect", 7, "unknown", "probe://unknown"),
+            (44, "completed-effect", 8, "observed_completed", "probe://completed"),
+        ]
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM events WHERE run_id = 'run-1' AND revision = 1"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute(
+                "SELECT fence FROM leases WHERE effect_id = 'completed-effect'"
+            ).fetchone()[0]
+            == 8
+        )
+        assert (
+            "UNIQUE (effect_id, fence)"
+            in connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'reconciliations'"
+            ).fetchone()[0]
+        )
     finally:
         connection.close()
 
@@ -504,6 +628,99 @@ def test_reopen_rejects_same_name_index_with_wrong_columns_or_uniqueness(
         Journal.open(journal_path)
 
 
+def test_conflicting_round2_v1_migration_fails_closed_and_rolls_back(
+    journal_path: Path,
+) -> None:
+    """Would fail if migration guessed a winner for one contradictory v1 command."""
+    create_round2_v1_database(journal_path, conflicting=True)
+
+    with pytest.raises(JournalStorageError, match="duplicate reconciliation command"):
+        Journal.open(journal_path)
+
+    connection = sqlite3.connect(journal_path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT schema_version FROM journal_metadata WHERE singleton = 1"
+            ).fetchone()[0]
+            == 1
+        )
+        assert connection.execute(
+            "SELECT reconciliation_id, outcome FROM reconciliations "
+            "WHERE effect_id = 'reconciled-effect' AND fence = 7 "
+            "ORDER BY reconciliation_id"
+        ).fetchall() == [(41, "unknown"), (45, "observed_absent")]
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'reconciliations_v1'"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        connection.close()
+
+
+def test_unknown_version_1_manifest_is_rejected_without_migration(
+    journal_path: Path,
+) -> None:
+    """Would fail if user_version alone authorized a weakened v1 migration source."""
+    create_round2_v1_database(journal_path)
+    connection = sqlite3.connect(journal_path)
+    connection.execute("DROP TRIGGER reconciliations_are_immutable_on_update")
+    connection.execute(
+        "CREATE TRIGGER reconciliations_are_immutable_on_update "
+        "BEFORE UPDATE ON reconciliations BEGIN SELECT 1; END"
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(JournalStorageError, match="unknown journal schema version 1"):
+        Journal.open(journal_path)
+
+    connection = sqlite3.connect(journal_path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT schema_version FROM journal_metadata WHERE singleton = 1"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        connection.close()
+
+
+def test_v2_database_rejects_direct_duplicate_reconciliation_command(
+    journal_path: Path, clock: MutableClock
+) -> None:
+    """Would fail if v2 did not enforce command identity below the API."""
+    created = Journal.open(journal_path, clock=clock)
+    seed_effect(created)
+    lease = created.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(minutes=1)
+    )
+    created.record_effect("deploy-1", lease.fence, EffectState.STARTED, None)
+    created.record_reconciliation(
+        "deploy-1",
+        lease.fence,
+        ReconciliationOutcome.UNKNOWN,
+        "probe://unknown",
+    )
+    created.close()
+
+    connection = sqlite3.connect(journal_path)
+    connection.execute("PRAGMA foreign_keys = ON")
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+        connection.execute(
+            "INSERT INTO reconciliations(run_id, effect_id, fence, outcome, evidence_ref, observed_at) "
+            "VALUES ('run-1', 'deploy-1', ?, 'observed_absent', 'probe://absent', ?)",
+            (lease.fence, clock.now.isoformat(timespec="microseconds")),
+        )
+    connection.close()
+
+
 def test_takeover_fences_old_worker(journal: Journal, clock: MutableClock) -> None:
     """Would fail if an expired worker retained write authority after takeover."""
     seed_effect(journal)
@@ -656,6 +873,168 @@ def test_each_authority_action_samples_clock_exactly_once(journal_path: Path) ->
     )
     assert clock.calls == 1
     journal.close()
+
+
+def test_stale_fence_denial_commits_watermark_without_effect_or_lease_mutation(
+    journal_path: Path, clock: MutableClock
+) -> None:
+    """Would fail if stale authority denial rolled back its observed time."""
+    journal = Journal.open(journal_path, clock=clock)
+    seed_effect(journal)
+    stale = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(seconds=0)
+    )
+    current = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-b", timedelta(minutes=1)
+    )
+    clock.advance(timedelta(seconds=10))
+    denied_at = clock.now
+
+    with pytest.raises(StaleFence):
+        journal.record_effect("deploy-1", stale.fence, EffectState.STARTED, None)
+
+    assert journal.get_effect("run-1", "deploy-1").state is EffectState.INTENT
+    connection = sqlite3.connect(journal_path)
+    try:
+        assert connection.execute(
+            "SELECT worker_id, fence FROM leases WHERE effect_id = 'deploy-1'"
+        ).fetchone() == ("worker-b", current.fence)
+    finally:
+        connection.close()
+    assert observed_watermark(journal_path) == denied_at.isoformat(
+        timespec="microseconds"
+    )
+    journal.close()
+
+    clock.now -= timedelta(seconds=5)
+    reopened = Journal.open(journal_path, clock=clock)
+    try:
+        with pytest.raises(ClockRollback):
+            reopened.acquire_attempt(
+                "run-1", "deploy-1", "worker-b", timedelta(minutes=1)
+            )
+    finally:
+        reopened.close()
+
+
+def test_effect_conflict_denial_commits_watermark_without_state_mutation(
+    journal_path: Path, clock: MutableClock
+) -> None:
+    """Would fail if an invalid effect edge lost its later clock observation."""
+    journal = Journal.open(journal_path, clock=clock)
+    seed_effect(journal)
+    lease = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(minutes=1)
+    )
+    clock.advance(timedelta(seconds=10))
+    denied_at = clock.now
+
+    with pytest.raises(EffectConflict):
+        journal.record_effect(
+            "deploy-1", lease.fence, EffectState.COMPLETED, "evidence://skipped"
+        )
+
+    assert journal.get_effect("run-1", "deploy-1").state is EffectState.INTENT
+    assert observed_watermark(journal_path) == denied_at.isoformat(
+        timespec="microseconds"
+    )
+    journal.close()
+
+    clock.now -= timedelta(seconds=5)
+    reopened = Journal.open(journal_path, clock=clock)
+    try:
+        with pytest.raises(ClockRollback):
+            reopened.record_effect("deploy-1", lease.fence, EffectState.STARTED, None)
+        assert reopened.get_effect("run-1", "deploy-1").state is EffectState.INTENT
+    finally:
+        reopened.close()
+
+
+def test_reconciliation_conflict_denial_commits_watermark_without_second_audit(
+    journal_path: Path, clock: MutableClock
+) -> None:
+    """Would fail if contradictory probe denial rolled back its observed time."""
+    journal = Journal.open(journal_path, clock=clock)
+    seed_effect(journal)
+    lease = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(minutes=1)
+    )
+    journal.record_effect("deploy-1", lease.fence, EffectState.STARTED, None)
+    committed = journal.record_reconciliation(
+        "deploy-1", lease.fence, ReconciliationOutcome.UNKNOWN, "probe://unknown"
+    )
+    clock.advance(timedelta(seconds=10))
+    denied_at = clock.now
+
+    with pytest.raises(EffectConflict):
+        journal.record_reconciliation(
+            "deploy-1",
+            lease.fence,
+            ReconciliationOutcome.OBSERVED_ABSENT,
+            "probe://absent",
+        )
+
+    assert journal.list_reconciliations("deploy-1") == (committed,)
+    assert observed_watermark(journal_path) == denied_at.isoformat(
+        timespec="microseconds"
+    )
+    journal.close()
+
+    clock.now -= timedelta(seconds=5)
+    reopened = Journal.open(journal_path, clock=clock)
+    try:
+        with pytest.raises(ClockRollback):
+            reopened.record_reconciliation(
+                "deploy-1",
+                lease.fence,
+                ReconciliationOutcome.UNKNOWN,
+                "probe://unknown",
+            )
+        assert reopened.list_reconciliations("deploy-1") == (committed,)
+    finally:
+        reopened.close()
+
+
+def test_invalid_reconciliation_state_denial_commits_watermark_without_audit(
+    journal_path: Path, clock: MutableClock
+) -> None:
+    """Would fail if invalid-state denial lost time or partially wrote an audit."""
+    journal = Journal.open(journal_path, clock=clock)
+    seed_effect(journal)
+    lease = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(minutes=1)
+    )
+    clock.advance(timedelta(seconds=10))
+    denied_at = clock.now
+
+    with pytest.raises(EffectConflict):
+        journal.record_reconciliation(
+            "deploy-1",
+            lease.fence,
+            ReconciliationOutcome.UNKNOWN,
+            "probe://invalid-state",
+        )
+
+    assert journal.get_effect("run-1", "deploy-1").state is EffectState.INTENT
+    assert journal.list_reconciliations("deploy-1") == ()
+    assert observed_watermark(journal_path) == denied_at.isoformat(
+        timespec="microseconds"
+    )
+    journal.close()
+
+    clock.now -= timedelta(seconds=5)
+    reopened = Journal.open(journal_path, clock=clock)
+    try:
+        with pytest.raises(ClockRollback):
+            reopened.record_reconciliation(
+                "deploy-1",
+                lease.fence,
+                ReconciliationOutcome.UNKNOWN,
+                "probe://invalid-state",
+            )
+        assert reopened.list_reconciliations("deploy-1") == ()
+    finally:
+        reopened.close()
 
 
 def test_exact_lease_expiry_is_available_for_takeover(
