@@ -4,7 +4,7 @@
   "required": ["schema_version", "delivery_id", "type", "base_revision", "workflow_release_digest", "owner_refs", "delta_operations", "cross_layer_impacts", "environment_obligations", "verification", "completion_conditions"],
   "properties": {
     "schema_version": {"const": "1.0"}, "delivery_id": {"type": "string", "minLength": 1}, "type": {"type": "string", "minLength": 1}, "base_revision": {"type": "string", "minLength": 1}, "workflow_release_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
-    "owner_refs": {"type": "array"}, "delta_operations": {"type": "array"}, "cross_layer_impacts": {"type": "array"}, "environment_obligations": {"type": "array"}, "verification": {"type": "array"}, "completion_conditions": {"type": "array"}
+    "owner_refs": {"type": "array", "items": {"type": "object", "required": ["kind", "record_id", "revision", "digest", "path"], "properties": {"kind": {"type": "string", "minLength": 1}, "record_id": {"type": "string", "minLength": 1}, "revision": {"type": "string", "minLength": 1}, "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "path": {"type": "string", "minLength": 1}}, "additionalProperties": false}}, "delta_operations": {"type": "array"}, "cross_layer_impacts": {"type": "array"}, "environment_obligations": {"type": "array"}, "verification": {"type": "array"}, "completion_conditions": {"type": "array"}
   },
   "additionalProperties": false
 }

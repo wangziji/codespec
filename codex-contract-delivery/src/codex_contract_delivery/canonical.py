@@ -71,7 +71,15 @@ def _normalize(value: object) -> object:
     if isinstance(value, tuple):
         return [_normalize(item) for item in value]
     if isinstance(value, Mapping):
-        return {str(key): _normalize(item) for key, item in value.items()}
+        normalized: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ContractParseError("contract mapping keys must be strings")
+            normalized_key = _normalize(key)
+            if normalized_key in normalized:
+                raise ContractParseError("normalized mapping key collision")
+            normalized[normalized_key] = _normalize(item)
+        return normalized
     return value
 
 

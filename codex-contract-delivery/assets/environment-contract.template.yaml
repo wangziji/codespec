@@ -1,10 +1,19 @@
 schema_version: "1.0"
 ci:
-  resource_id: "<writable-ci-resource>"
+  provider: "<provider>"
+  kind: "<resource-kind>"
+  account_or_host: "<account-or-host>"
+  resource_id: "<writable-ci-resource-id>"
   writable: true
 test:
-  resource_id: "<writable-test-resource>"
+  provider: "<provider>"
+  kind: "<resource-kind>"
+  account_or_host: "<account-or-host>"
+  resource_id: "<writable-test-resource-id>"
   writable: true
 prod:
-  resource_id: "<writable-prod-resource>"
+  provider: "<provider>"
+  kind: "<resource-kind>"
+  account_or_host: "<account-or-host>"
+  resource_id: "<writable-prod-resource-id>"
   writable: true

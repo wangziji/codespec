@@ -3,13 +3,26 @@
 import json
 import re
 from collections.abc import Mapping
+from datetime import datetime
 from pathlib import Path
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
 
 from .models import Finding
 
 _ADDITIONAL_PROPERTY = re.compile(r"\('(.+)' was unexpected\)")
+_FORMAT_CHECKER = FormatChecker()
+
+
+@_FORMAT_CHECKER.checks("date-time")
+def _is_rfc3339_datetime(value: object) -> bool:
+    """Validate the timezone-qualified datetime form required by canonical records."""
+    if not isinstance(value, str) or "T" not in value:
+        return False
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo is not None
+    except ValueError:
+        return False
 
 
 class SchemaRegistry:
@@ -39,7 +52,10 @@ class SchemaRegistry:
                 ),
             )
 
-        findings = [self._finding(error) for error in Draft202012Validator(schema).iter_errors(value)]
+        findings = [
+            self._finding(error)
+            for error in Draft202012Validator(schema, format_checker=_FORMAT_CHECKER).iter_errors(value)
+        ]
         return tuple(sorted(findings, key=lambda item: (item.path, item.code, item.message)))
 
     @staticmethod
