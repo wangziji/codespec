@@ -48,6 +48,10 @@ class DatabaseBusy(JournalError):
     """SQLite could not begin the bounded write transaction."""
 
 
+class ClockRollback(JournalError):
+    """The observed wall clock moved behind durable lease time."""
+
+
 class JournalStorageError(JournalError):
     """SQLite rejected a journal operation for a non-contention reason."""
 
@@ -57,6 +61,12 @@ class EffectState(str, Enum):
     STARTED = "started"
     COMPLETED = "completed"
     RECONCILED = "reconciled"
+
+
+class ReconciliationOutcome(str, Enum):
+    OBSERVED_COMPLETED = "observed_completed"
+    OBSERVED_ABSENT = "observed_absent"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
@@ -105,6 +115,17 @@ class EffectRecord:
 
 
 @dataclass(frozen=True)
+class ReconciliationRecord:
+    reconciliation_id: int
+    run_id: str
+    effect_id: str
+    fence: int
+    outcome: ReconciliationOutcome
+    evidence_ref: str
+    observed_at: datetime
+
+
+@dataclass(frozen=True)
 class JournalEvent:
     event_id: int
     run_id: str
@@ -141,8 +162,17 @@ class Lease:
 _STATE_VALUES = ", ".join(f"'{state.value}'" for state in RunState)
 _EVENT_VALUES = ", ".join(f"'{event.value}'" for event in RunEvent)
 _EFFECT_VALUES = ", ".join(f"'{state.value}'" for state in EffectState)
+_RECONCILIATION_VALUES = ", ".join(
+    f"'{outcome.value}'" for outcome in ReconciliationOutcome
+)
 
 _SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS journal_metadata (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    schema_version INTEGER NOT NULL CHECK(schema_version >= 1),
+    last_observed_time TEXT
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY CHECK(length(run_id) > 0),
     state TEXT NOT NULL CHECK(state IN ({_STATE_VALUES})),
@@ -160,12 +190,31 @@ CREATE TABLE IF NOT EXISTS effects (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (run_id, effect_id),
     CHECK (
-        (state IN ('intent', 'started') AND evidence_ref IS NULL)
+        (state IN ('intent', 'started', 'reconciled') AND evidence_ref IS NULL)
         OR
-        (state IN ('completed', 'reconciled') AND length(evidence_ref) > 0)
+        (state = 'completed' AND length(evidence_ref) > 0)
     ),
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
 ) STRICT;
+
+CREATE TABLE IF NOT EXISTS reconciliations (
+    reconciliation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    effect_id TEXT NOT NULL,
+    fence INTEGER NOT NULL CHECK(fence > 0),
+    outcome TEXT NOT NULL CHECK(outcome IN ({_RECONCILIATION_VALUES})),
+    evidence_ref TEXT NOT NULL CHECK(length(evidence_ref) > 0),
+    observed_at TEXT NOT NULL,
+    UNIQUE (effect_id, fence, outcome, evidence_ref),
+    FOREIGN KEY (run_id, effect_id) REFERENCES effects(run_id, effect_id)
+        ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_effects_run_state
+ON effects(run_id, state);
+
+CREATE INDEX IF NOT EXISTS idx_reconciliations_effect
+ON reconciliations(effect_id, reconciliation_id);
 
 CREATE TABLE IF NOT EXISTS leases (
     run_id TEXT NOT NULL,
@@ -199,14 +248,14 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS leases_fence_must_advance
 BEFORE UPDATE ON leases
-WHEN NEW.fence <= OLD.fence
+WHEN NEW.fence != OLD.fence AND NEW.fence <= OLD.fence
 BEGIN
     SELECT RAISE(ABORT, 'lease fence must increase');
 END;
 
 CREATE TRIGGER IF NOT EXISTS terminal_effects_are_immutable
 BEFORE UPDATE ON effects
-WHEN OLD.state IN ('completed', 'reconciled')
+WHEN OLD.state = 'completed'
 BEGIN
     SELECT RAISE(ABORT, 'terminal effect is immutable');
 END;
@@ -222,11 +271,111 @@ BEFORE DELETE ON events
 BEGIN
     SELECT RAISE(ABORT, 'journal events are immutable');
 END;
+
+CREATE TRIGGER IF NOT EXISTS reconciliations_are_immutable_on_update
+BEFORE UPDATE ON reconciliations
+BEGIN
+    SELECT RAISE(ABORT, 'reconciliation audit is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS reconciliations_are_immutable_on_delete
+BEFORE DELETE ON reconciliations
+BEGIN
+    SELECT RAISE(ABORT, 'reconciliation audit is immutable');
+END;
+
+INSERT INTO journal_metadata(singleton, schema_version, last_observed_time)
+VALUES (1, 1, NULL);
 """
+
+
+def _sql_statements(script: str) -> tuple[str, ...]:
+    statements: list[str] = []
+    pending = ""
+    for line in script.splitlines():
+        pending += line + "\n"
+        if sqlite3.complete_statement(pending):
+            statement = pending.strip()
+            if statement:
+                statements.append(statement)
+            pending = ""
+    if pending.strip():
+        raise RuntimeError("internal schema contains an incomplete SQL statement")
+    return tuple(statements)
+
+
+_CURRENT_SCHEMA_VERSION = 1
+_CURRENT_SCHEMA_STATEMENTS = _sql_statements(_SCHEMA)
+_MIGRATIONS: dict[int, tuple[str, ...]] = {0: _CURRENT_SCHEMA_STATEMENTS}
+
+_V0_COLUMN_SIGNATURES = {
+    "runs": (
+        ("run_id", "TEXT", 1, 1),
+        ("state", "TEXT", 1, 0),
+        ("revision", "INTEGER", 1, 0),
+        ("updated_at", "TEXT", 1, 0),
+    ),
+    "effects": (
+        ("run_id", "TEXT", 1, 1),
+        ("effect_id", "TEXT", 1, 2),
+        ("kind", "TEXT", 1, 0),
+        ("state", "TEXT", 1, 0),
+        ("evidence_ref", "TEXT", 0, 0),
+        ("created_at", "TEXT", 1, 0),
+        ("updated_at", "TEXT", 1, 0),
+    ),
+    "leases": (
+        ("run_id", "TEXT", 1, 1),
+        ("effect_id", "TEXT", 1, 2),
+        ("worker_id", "TEXT", 1, 0),
+        ("fence", "INTEGER", 1, 0),
+        ("expires_at", "TEXT", 1, 0),
+    ),
+    "events": (
+        ("event_id", "INTEGER", 0, 1),
+        ("run_id", "TEXT", 1, 0),
+        ("revision", "INTEGER", 1, 0),
+        ("event", "TEXT", 1, 0),
+        ("state", "TEXT", 1, 0),
+        ("context_json", "TEXT", 1, 0),
+        ("created_at", "TEXT", 1, 0),
+    ),
+}
+_CURRENT_COLUMN_SIGNATURES = {
+    "journal_metadata": (
+        ("singleton", "INTEGER", 0, 1),
+        ("schema_version", "INTEGER", 1, 0),
+        ("last_observed_time", "TEXT", 0, 0),
+    ),
+    **_V0_COLUMN_SIGNATURES,
+    "reconciliations": (
+        ("reconciliation_id", "INTEGER", 0, 1),
+        ("run_id", "TEXT", 1, 0),
+        ("effect_id", "TEXT", 1, 0),
+        ("fence", "INTEGER", 1, 0),
+        ("outcome", "TEXT", 1, 0),
+        ("evidence_ref", "TEXT", 1, 0),
+        ("observed_at", "TEXT", 1, 0),
+    ),
+}
+_CURRENT_INDEXES = frozenset({"idx_effects_run_state", "idx_reconciliations_effect"})
+_CURRENT_TRIGGERS = frozenset(
+    {
+        "runs_revision_must_advance",
+        "leases_fence_must_advance",
+        "terminal_effects_are_immutable",
+        "events_are_immutable_on_update",
+        "events_are_immutable_on_delete",
+        "reconciliations_are_immutable_on_update",
+        "reconciliations_are_immutable_on_delete",
+    }
+)
 
 
 class Journal:
     """Own one SQLite connection and serialize its local write transactions."""
+
+    SCHEMA_VERSION = _CURRENT_SCHEMA_VERSION
 
     def __init__(
         self,
@@ -252,6 +401,7 @@ class Journal:
         if busy_timeout_ms < 0:
             raise ValueError("busy_timeout_ms must be non-negative")
         path.parent.mkdir(parents=True, exist_ok=True)
+        connection: sqlite3.Connection | None = None
         try:
             connection = sqlite3.connect(
                 path,
@@ -264,11 +414,17 @@ class Journal:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA synchronous = FULL")
-            connection.executescript(_SCHEMA)
+            _initialize_or_migrate(connection)
+            _validate_connection_and_schema(connection, busy_timeout_ms)
+        except JournalError:
+            if connection is not None:
+                connection.close()
+            raise
         except sqlite3.Error as error:
-            if "connection" in locals():
+            if connection is not None:
                 connection.close()
             raise _translate_sqlite(error) from error
+        assert connection is not None
         return cls(path, connection, clock or _utc_now)
 
     def close(self) -> None:
@@ -411,12 +567,13 @@ class Journal:
                     f"effect {effect_id} does not exist for run {run_id}"
                 )
             effect_state = EffectState(effect["state"])
-            if effect_state in {EffectState.COMPLETED, EffectState.RECONCILED}:
+            if effect_state is EffectState.COMPLETED:
                 raise EffectConflict(
                     f"effect {effect_id} is already {effect_state.value}"
                 )
 
             now = self._now()
+            _advance_observed_time(self._connection, now)
             current = self._connection.execute(
                 "SELECT worker_id, fence, expires_at FROM leases "
                 "WHERE run_id = ? AND effect_id = ?",
@@ -494,6 +651,10 @@ class Journal:
                 current in {EffectState.COMPLETED, EffectState.RECONCILED}
                 and current is target
             ):
+                if row["fence"] != fence:
+                    raise StaleFence(
+                        f"fence {fence} did not commit terminal effect {effect_id}"
+                    )
                 if row["evidence_ref"] != evidence_ref:
                     raise EffectConflict(
                         "effect evidence conflicts with durable evidence"
@@ -514,11 +675,8 @@ class Journal:
                 return
 
             allowed = {
-                EffectState.INTENT: {EffectState.STARTED, EffectState.RECONCILED},
-                EffectState.STARTED: {
-                    EffectState.COMPLETED,
-                    EffectState.RECONCILED,
-                },
+                EffectState.INTENT: {EffectState.STARTED},
+                EffectState.STARTED: {EffectState.COMPLETED},
                 EffectState.COMPLETED: set(),
                 EffectState.RECONCILED: set(),
             }
@@ -537,6 +695,116 @@ class Journal:
                 "UPDATE effects SET state = ?, evidence_ref = ?, updated_at = ? "
                 "WHERE effect_id = ?",
                 (target.value, evidence_ref, _format_time(self._now()), effect_id),
+            )
+
+    def record_reconciliation(
+        self,
+        effect_id: str,
+        fence: int,
+        outcome: ReconciliationOutcome,
+        evidence_ref: str | None,
+    ) -> ReconciliationRecord:
+        _require_identifier("effect_id", effect_id)
+        if not isinstance(fence, int) or fence <= 0:
+            raise StaleFence("fence must be a positive integer")
+        try:
+            normalized_outcome = ReconciliationOutcome(outcome)
+        except (TypeError, ValueError) as error:
+            raise EffectConflict("unknown reconciliation outcome") from error
+        if not isinstance(evidence_ref, str) or not evidence_ref.strip():
+            raise EffectConflict(
+                f"{normalized_outcome.value} reconciliation requires probe evidence"
+            )
+
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT e.run_id, e.state, e.evidence_ref, l.fence, l.expires_at "
+                "FROM effects e LEFT JOIN leases l "
+                "ON l.run_id = e.run_id AND l.effect_id = e.effect_id "
+                "WHERE e.effect_id = ?",
+                (effect_id,),
+            ).fetchone()
+            if row is None:
+                raise EffectNotFound(f"effect {effect_id} does not exist")
+            current = EffectState(row["state"])
+            if current is EffectState.COMPLETED:
+                if row["fence"] != fence:
+                    raise StaleFence(
+                        f"fence {fence} did not commit terminal effect {effect_id}"
+                    )
+                if (
+                    normalized_outcome is ReconciliationOutcome.OBSERVED_COMPLETED
+                    and row["evidence_ref"] == evidence_ref
+                ):
+                    existing = self._connection.execute(
+                        "SELECT reconciliation_id, run_id, effect_id, fence, outcome, "
+                        "evidence_ref, observed_at FROM reconciliations "
+                        "WHERE effect_id = ? AND fence = ? AND outcome = ? AND evidence_ref = ?",
+                        (effect_id, fence, normalized_outcome.value, evidence_ref),
+                    ).fetchone()
+                    if existing is not None:
+                        return _reconciliation_from_row(existing)
+                raise EffectConflict("completed reconciliation evidence is immutable")
+            if current not in {EffectState.STARTED, EffectState.RECONCILED}:
+                raise EffectConflict(
+                    f"effect in {current.value} does not require reconciliation"
+                )
+            now = self._now()
+            if (
+                row["fence"] is None
+                or row["fence"] != fence
+                or _parse_time(row["expires_at"]) <= now
+            ):
+                raise StaleFence(f"fence {fence} is not current for effect {effect_id}")
+
+            cursor = self._connection.execute(
+                "INSERT INTO reconciliations(run_id, effect_id, fence, outcome, evidence_ref, observed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    row["run_id"],
+                    effect_id,
+                    fence,
+                    normalized_outcome.value,
+                    evidence_ref,
+                    _format_time(now),
+                ),
+            )
+            if normalized_outcome is ReconciliationOutcome.OBSERVED_COMPLETED:
+                self._connection.execute(
+                    "UPDATE effects SET state = ?, evidence_ref = ?, updated_at = ? "
+                    "WHERE effect_id = ?",
+                    (
+                        EffectState.COMPLETED.value,
+                        evidence_ref,
+                        _format_time(now),
+                        effect_id,
+                    ),
+                )
+            elif normalized_outcome is ReconciliationOutcome.OBSERVED_ABSENT:
+                self._connection.execute(
+                    "UPDATE effects SET state = ?, evidence_ref = NULL, updated_at = ? "
+                    "WHERE effect_id = ?",
+                    (EffectState.INTENT.value, _format_time(now), effect_id),
+                )
+                self._connection.execute(
+                    "UPDATE leases SET expires_at = ? WHERE run_id = ? AND effect_id = ?",
+                    (_format_time(now), row["run_id"], effect_id),
+                )
+            else:
+                self._connection.execute(
+                    "UPDATE effects SET state = ?, evidence_ref = NULL, updated_at = ? "
+                    "WHERE effect_id = ?",
+                    (EffectState.RECONCILED.value, _format_time(now), effect_id),
+                )
+
+            return ReconciliationRecord(
+                cursor.lastrowid,
+                row["run_id"],
+                effect_id,
+                fence,
+                normalized_outcome,
+                evidence_ref,
+                now,
             )
 
     def get_run(self, run_id: str) -> RunSnapshot | None:
@@ -588,6 +856,15 @@ class Journal:
             )
             for row in rows
         )
+
+    def list_reconciliations(self, effect_id: str) -> tuple[ReconciliationRecord, ...]:
+        rows = self._execute_read(
+            "SELECT reconciliation_id, run_id, effect_id, fence, outcome, "
+            "evidence_ref, observed_at FROM reconciliations "
+            "WHERE effect_id = ? ORDER BY reconciliation_id",
+            (effect_id,),
+        ).fetchall()
+        return tuple(_reconciliation_from_row(row) for row in rows)
 
     def _execute_read(
         self, statement: str, parameters: tuple[object, ...]
@@ -653,8 +930,168 @@ def _json_ready(value: object) -> object:
     raise ValueError(f"context value is not JSON serializable: {type(value).__name__}")
 
 
+def _initialize_or_migrate(connection: sqlite3.Connection) -> None:
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if version > _CURRENT_SCHEMA_VERSION:
+        raise JournalStorageError(f"future journal schema version {version}")
+
+    tables = _object_names(connection, "table")
+    if version == 0 and not tables:
+        _apply_schema_steps(
+            connection,
+            _CURRENT_SCHEMA_STATEMENTS,
+            target_version=_CURRENT_SCHEMA_VERSION,
+            label="initialization",
+        )
+        return
+    if version == 0 and not _is_known_v0(connection):
+        raise JournalStorageError("unknown or partial unversioned journal schema")
+
+    while version < _CURRENT_SCHEMA_VERSION:
+        statements = _MIGRATIONS.get(version)
+        if statements is None:
+            raise JournalStorageError(
+                f"unsupported journal schema migration from version {version}"
+            )
+        _apply_schema_steps(
+            connection,
+            statements,
+            target_version=version + 1,
+            label=f"migration {version}->{version + 1}",
+        )
+        version += 1
+
+
+def _apply_schema_steps(
+    connection: sqlite3.Connection,
+    statements: tuple[str, ...],
+    *,
+    target_version: int,
+    label: str,
+) -> None:
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in statements:
+            connection.execute(statement)
+        updated = connection.execute(
+            "UPDATE journal_metadata SET schema_version = ? WHERE singleton = 1",
+            (target_version,),
+        )
+        if updated.rowcount != 1:
+            raise sqlite3.DatabaseError("schema metadata row was not created")
+        connection.execute(f"PRAGMA user_version = {target_version}")
+        connection.commit()
+    except sqlite3.Error as error:
+        if connection.in_transaction:
+            connection.rollback()
+        raise JournalStorageError(f"journal schema {label} failed") from error
+
+
+def _is_known_v0(connection: sqlite3.Connection) -> bool:
+    if _object_names(connection, "table") != frozenset(_V0_COLUMN_SIGNATURES):
+        return False
+    if _object_names(connection, "trigger"):
+        return False
+    if _object_names(connection, "index"):
+        return False
+    return all(
+        _table_signature(connection, table) == signature
+        for table, signature in _V0_COLUMN_SIGNATURES.items()
+    )
+
+
+def _validate_connection_and_schema(
+    connection: sqlite3.Connection, busy_timeout_ms: int
+) -> None:
+    settings = {
+        "foreign_keys": connection.execute("PRAGMA foreign_keys").fetchone()[0],
+        "journal_mode": connection.execute("PRAGMA journal_mode").fetchone()[0],
+        "busy_timeout": connection.execute("PRAGMA busy_timeout").fetchone()[0],
+        "synchronous": connection.execute("PRAGMA synchronous").fetchone()[0],
+    }
+    if (
+        settings["foreign_keys"] != 1
+        or str(settings["journal_mode"]).lower() != "wal"
+        or settings["busy_timeout"] != busy_timeout_ms
+        or settings["synchronous"] != 2
+    ):
+        raise JournalStorageError("journal schema validation failed: connection PRAGMA")
+
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if version != _CURRENT_SCHEMA_VERSION:
+        raise JournalStorageError("journal schema validation failed: user_version")
+    if _object_names(connection, "table") != frozenset(_CURRENT_COLUMN_SIGNATURES):
+        raise JournalStorageError("journal schema validation failed: tables")
+    for table, signature in _CURRENT_COLUMN_SIGNATURES.items():
+        if _table_signature(connection, table) != signature:
+            raise JournalStorageError(
+                f"journal schema validation failed: columns for {table}"
+            )
+    if _CURRENT_INDEXES != _object_names(connection, "index"):
+        raise JournalStorageError("journal schema validation failed: indexes")
+    if _CURRENT_TRIGGERS != _object_names(connection, "trigger"):
+        raise JournalStorageError("journal schema validation failed: triggers")
+    metadata = connection.execute(
+        "SELECT schema_version FROM journal_metadata WHERE singleton = 1"
+    ).fetchone()
+    if metadata is None or metadata[0] != _CURRENT_SCHEMA_VERSION:
+        raise JournalStorageError("journal schema validation failed: metadata version")
+
+
+def _object_names(connection: sqlite3.Connection, kind: str) -> frozenset[str]:
+    return frozenset(
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = ? AND name NOT LIKE 'sqlite_%'",
+            (kind,),
+        )
+    )
+
+
+def _table_signature(
+    connection: sqlite3.Connection, table: str
+) -> tuple[tuple[str, str, int, int], ...]:
+    safe_table = table.replace('"', '""')
+    return tuple(
+        (row[1], row[2].upper(), row[3], row[5])
+        for row in connection.execute(f'PRAGMA table_info("{safe_table}")').fetchall()
+    )
+
+
+def _advance_observed_time(
+    connection: sqlite3.Connection, observed_at: datetime
+) -> None:
+    row = connection.execute(
+        "SELECT last_observed_time FROM journal_metadata WHERE singleton = 1"
+    ).fetchone()
+    if row is None:
+        raise JournalStorageError("journal schema validation failed: metadata row")
+    persisted = _parse_time(row[0]) if row[0] is not None else None
+    if persisted is not None and observed_at < persisted:
+        raise ClockRollback(
+            f"clock moved backwards from {_format_time(persisted)} to {_format_time(observed_at)}"
+        )
+    if persisted is None or observed_at > persisted:
+        connection.execute(
+            "UPDATE journal_metadata SET last_observed_time = ? WHERE singleton = 1",
+            (_format_time(observed_at),),
+        )
+
+
 def _translate_sqlite(error: sqlite3.Error) -> JournalError:
     message = str(error).lower()
     if "locked" in message or "busy" in message:
         return DatabaseBusy("journal database is busy")
     return JournalStorageError("journal storage operation failed")
+
+
+def _reconciliation_from_row(row: sqlite3.Row) -> ReconciliationRecord:
+    return ReconciliationRecord(
+        row["reconciliation_id"],
+        row["run_id"],
+        row["effect_id"],
+        row["fence"],
+        ReconciliationOutcome(row["outcome"]),
+        row["evidence_ref"],
+        _parse_time(row["observed_at"]),
+    )
