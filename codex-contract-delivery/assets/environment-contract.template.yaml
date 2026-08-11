@@ -1,19 +1,25 @@
 schema_version: "1.0"
 ci:
-  provider: "<provider>"
-  kind: "<resource-kind>"
-  account_or_host: "<account-or-host>"
-  resource_id: "<writable-ci-resource-id>"
+  provider: "<mysql|postgresql|redis|kafka|nacos|s3|kubernetes|filesystem|saas>"
+  kind: "<same-as-provider>"
+  account_or_host: "<real-account-or-host>"
+  resource_id: "<real-writable-resource-id>"
+  canonical_locator: "<provider>://<real-host>/<real-resource-path>"
+  identity_digest: "sha256:<64-lowercase-hex-from-identity-probe>"
   writable: true
 test:
-  provider: "<provider>"
-  kind: "<resource-kind>"
-  account_or_host: "<account-or-host>"
-  resource_id: "<writable-test-resource-id>"
+  provider: "<mysql|postgresql|redis|kafka|nacos|s3|kubernetes|filesystem|saas>"
+  kind: "<same-as-provider>"
+  account_or_host: "<real-account-or-host>"
+  resource_id: "<real-writable-resource-id>"
+  canonical_locator: "<provider>://<real-host>/<real-resource-path>"
+  identity_digest: "sha256:<64-lowercase-hex-from-identity-probe>"
   writable: true
 prod:
-  provider: "<provider>"
-  kind: "<resource-kind>"
-  account_or_host: "<account-or-host>"
-  resource_id: "<writable-prod-resource-id>"
+  provider: "<mysql|postgresql|redis|kafka|nacos|s3|kubernetes|filesystem|saas>"
+  kind: "<same-as-provider>"
+  account_or_host: "<real-account-or-host>"
+  resource_id: "<real-writable-resource-id>"
+  canonical_locator: "<provider>://<real-host>/<real-resource-path>"
+  identity_digest: "sha256:<64-lowercase-hex-from-identity-probe>"
   writable: true

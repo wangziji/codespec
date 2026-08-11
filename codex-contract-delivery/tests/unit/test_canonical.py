@@ -186,16 +186,23 @@ def test_penpot_index_rejects_missing_or_ambiguous_design_version(
 
 
 def valid_environment_contract() -> dict[str, object]:
-    def resource(name: str) -> dict[str, object]:
+    def resource(provider: str, locator: str) -> dict[str, object]:
         return {
-            "provider": "github",
-            "kind": "repository-environment",
-            "account_or_host": "acme/trade-wise",
-            "resource_id": f"trade-wise-{name}",
+            "provider": provider,
+            "kind": provider,
+            "account_or_host": "platform.internal",
+            "resource_id": "tradewise-primary",
+            "canonical_locator": locator,
+            "identity_digest": "sha256:" + "d" * 64,
             "writable": True,
         }
 
-    return {"schema_version": "1.0", "ci": resource("ci"), "test": resource("test"), "prod": resource("prod")}
+    return {
+        "schema_version": "1.0",
+        "ci": resource("postgresql", "postgresql://db.internal:5432/tradewise?role=writer"),
+        "test": resource("redis", "redis://cache.internal:6379/0"),
+        "prod": resource("kubernetes", "kubernetes://cluster.internal/namespace/tradewise?context=prod"),
+    }
 
 
 def test_environment_contract_accepts_structured_writable_resource_identity(
@@ -203,6 +210,51 @@ def test_environment_contract_accepts_structured_writable_resource_identity(
 ) -> None:
     """Would fail if real writable environment identities were no longer supported."""
     assert schema_registry.validate("environment-contract", valid_environment_contract()) == ()
+
+
+def test_environment_contract_accepts_database_and_non_database_resource(
+    schema_registry: SchemaRegistry,
+) -> None:
+    """Would fail if controlled provider/kind pairs excluded valid V1 resource classes."""
+    value = valid_environment_contract()
+    value["ci"] = value["ci"] | {
+        "provider": "mysql",
+        "kind": "mysql",
+        "canonical_locator": "mysql://db.internal:3306/tradewise?role=writer",
+    }
+    value["prod"] = value["prod"] | {
+        "provider": "s3",
+        "kind": "s3",
+        "canonical_locator": "s3://bucket.internal/tradewise-release?region=us-east-1",
+    }
+
+    assert schema_registry.validate("environment-contract", value) == ()
+
+
+@pytest.mark.parametrize(
+    ("change", "expected_code"),
+    [
+        (
+            {"provider": "x", "kind": "foo", "canonical_locator": "x://x/foo"},
+            "CDD-SCHEMA-ENUM",
+        ),
+        ({"canonical_locator": "mysql://db.internal:3306/tradewise"}, "CDD-ENV-LOCATOR-SCHEME"),
+        ({"canonical_locator": "postgresql:///"}, "CDD-ENV-LOCATOR-AUTHORITY"),
+        ({"canonical_locator": "postgresql://prod/prod"}, "CDD-ENV-LOCATOR-PLACEHOLDER"),
+        ({"canonical_locator": "postgresql://placeholder.internal/placeholder"}, "CDD-ENV-LOCATOR-PLACEHOLDER"),
+        ({"identity_digest": "sha256:not-a-digest"}, "CDD-SCHEMA-PATTERN"),
+    ],
+)
+def test_environment_contract_rejects_unbound_or_placeholder_identity(
+    schema_registry: SchemaRegistry, change: dict[str, str], expected_code: str
+) -> None:
+    """Would fail if untrusted locators or identity probes could look canonical."""
+    value = valid_environment_contract()
+    value["ci"] = value["ci"] | change
+
+    findings = schema_registry.validate("environment-contract", value)
+
+    assert expected_code in {item.code for item in findings}
 
 
 @pytest.mark.parametrize("environment", ["ci", "test", "prod"])
@@ -232,6 +284,49 @@ def test_learning_signal_rejects_malformed_timestamp(schema_registry: SchemaRegi
             "recorded_at": "not-a-timestamp",
         },
     )
+
+    assert [(item.code, item.path) for item in findings] == [
+        ("CDD-SCHEMA-FORMAT", "recorded_at")
+    ]
+
+
+def learning_signal(recorded_at: str) -> dict[str, str]:
+    return {
+        "schema_version": "1.0",
+        "signal_id": "L-1",
+        "source": "review",
+        "observation": "Timestamp validation must follow RFC3339 structure.",
+        "recorded_at": recorded_at,
+    }
+
+
+@pytest.mark.parametrize(
+    "recorded_at",
+    ["2026-08-11T22:00:01Z", "2026-08-11t22:00:01z", "2026-08-11T22:00:01+08:30"],
+)
+def test_learning_signal_accepts_rfc3339_timestamp_variants(
+    schema_registry: SchemaRegistry, recorded_at: str
+) -> None:
+    """Would fail if valid RFC3339 Z or offset variants were rejected."""
+    assert schema_registry.validate("learning-signal", learning_signal(recorded_at)) == ()
+
+
+@pytest.mark.parametrize(
+    "recorded_at",
+    [
+        "2026-08-11T22:00:01+08:30:15",
+        "2026-08-11 22:00:01Z",
+        "2026-08-11T22:00:01",
+        "2026-08-11T22:00+08:00",
+        "2026-02-30T22:00:01Z",
+        "2026-08-11T22:00:01+24:00",
+    ],
+)
+def test_learning_signal_rejects_non_rfc3339_timestamp_structure(
+    schema_registry: SchemaRegistry, recorded_at: str
+) -> None:
+    """Would fail if malformed RFC3339 structure or invalid ranges were accepted."""
+    findings = schema_registry.validate("learning-signal", learning_signal(recorded_at))
 
     assert [(item.code, item.path) for item in findings] == [
         ("CDD-SCHEMA-FORMAT", "recorded_at")
