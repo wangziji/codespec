@@ -1,0 +1,7 @@
+baseline: baseline
+effective_contract: effective
+penpot: old-digest
+plan: plan
+workflow_release: workflow
+release: new-release
+canary: canary

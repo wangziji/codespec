@@ -11,6 +11,17 @@ from types import MappingProxyType
 from .models import Finding
 
 
+def freeze_value(value: object) -> object:
+    """Recursively freeze contract payloads before they cross a public boundary."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({str(key): freeze_value(item) for key, item in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(freeze_value(item) for item in value)
+    if isinstance(value, set | frozenset):
+        return frozenset(freeze_value(item) for item in value)
+    return value
+
+
 class ChangeLevel(str, Enum):
     L0 = "L0"
     L1 = "L1"
@@ -25,7 +36,7 @@ class ContractNode:
     origin: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "value", MappingProxyType(dict(self.value)))
+        object.__setattr__(self, "value", freeze_value(self.value))
 
 
 @dataclass(frozen=True)
@@ -70,18 +81,18 @@ class ApprovalVerifier:
     """Invalidate an approval whenever any dependency bound by it changes."""
 
     def verify(self, record: ApprovalRecord, dependencies: Mapping[str, str]) -> ApprovalResult:
-        invalidated = tuple(
-            name
-            for name, approved_digest in record.dependencies.items()
-            if name in dependencies and dependencies[name] != approved_digest
-        )
+        bound = record.dependencies
+        missing = sorted(set(bound) - set(dependencies))
+        extra = sorted(set(dependencies) - set(bound))
+        stale = sorted(name for name in set(bound) & set(dependencies) if bound[name] != dependencies[name])
+        invalidated = tuple(missing + extra + stale)
         findings = tuple(
-            Finding(
-                "CDD-APPROVAL-STALE-DEPENDENCY",
-                f"Approval dependency changed: {name}",
-                name,
+            Finding(code, f"Approval dependency {description}: {name}", name)
+            for name, code, description in (
+                *((name, "CDD-APPROVAL-MISSING-DEPENDENCY", "is missing") for name in missing),
+                *((name, "CDD-APPROVAL-EXTRA-DEPENDENCY", "is not bound") for name in extra),
+                *((name, "CDD-APPROVAL-STALE-DEPENDENCY", "changed") for name in stale),
             )
-            for name in invalidated
         )
         return ApprovalResult(not invalidated, invalidated, findings)
 
@@ -95,8 +106,11 @@ _L2_KINDS = frozenset(
 
 def classify_change(changed_nodes: Iterable[ContractNode]) -> ChangeLevel:
     """Derive approval level from authoritative node kinds, never caller labels."""
+    materialized = tuple(changed_nodes)
+    if not materialized:
+        return ChangeLevel.L2
     level = ChangeLevel.L0
-    for node in changed_nodes:
+    for node in materialized:
         if node.kind in _L2_KINDS or node.kind not in _L0_KINDS | _L1_KINDS:
             return ChangeLevel.L2
         if node.kind in _L1_KINDS:
