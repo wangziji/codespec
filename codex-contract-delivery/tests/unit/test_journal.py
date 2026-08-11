@@ -36,6 +36,18 @@ class MutableClock:
         self.now += delta
 
 
+class AdvancingClock:
+    def __init__(self) -> None:
+        self.now = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+        self.calls = 0
+
+    def __call__(self) -> datetime:
+        observed = self.now
+        self.now += timedelta(seconds=1)
+        self.calls += 1
+        return observed
+
+
 @pytest.fixture
 def clock() -> MutableClock:
     return MutableClock()
@@ -69,54 +81,123 @@ def seed_effect(journal: Journal, effect_id: str = "deploy-1") -> None:
     journal.transition(request(effect_id=effect_id))
 
 
-def create_minimal_v0_database(path: Path, *, revision_type: str = "INTEGER") -> None:
-    """Create the supported test-only v0 migration input; it is not a production claim."""
+def create_ba17dca_v0_database(path: Path, *, revision_type: str = "INTEGER") -> None:
+    """Create the exact unversioned schema shipped by commit ba17dca."""
     connection = sqlite3.connect(path)
     script = """
         CREATE TABLE runs (
-            run_id TEXT PRIMARY KEY,
-            state TEXT NOT NULL,
-            revision __REVISION_TYPE__ NOT NULL,
+            run_id TEXT PRIMARY KEY CHECK(length(run_id) > 0),
+            state TEXT NOT NULL CHECK(state IN ('new', 'discovery', 'requirements', 'gate_1', 'design', 'modules', 'gate_2', 'planning', 'gate_3', 'implementation', 'verification', 'test', 'production_authorization', 'prod', 'acceptance', 'completed', 'incident', 'correction', 'rollback', 'safe_checkpoint')),
+            revision __REVISION_TYPE__ NOT NULL CHECK(revision >= 0),
             updated_at TEXT NOT NULL
         ) STRICT;
         CREATE TABLE effects (
             run_id TEXT NOT NULL,
-            effect_id TEXT NOT NULL UNIQUE,
-            kind TEXT NOT NULL,
-            state TEXT NOT NULL,
+            effect_id TEXT NOT NULL UNIQUE CHECK(length(effect_id) > 0),
+            kind TEXT NOT NULL CHECK(length(kind) > 0),
+            state TEXT NOT NULL CHECK(state IN ('intent', 'started', 'completed', 'reconciled')),
             evidence_ref TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (run_id, effect_id),
-            FOREIGN KEY (run_id) REFERENCES runs(run_id)
+            CHECK (
+                (state IN ('intent', 'started') AND evidence_ref IS NULL)
+                OR
+                (state IN ('completed', 'reconciled') AND length(evidence_ref) > 0)
+            ),
+            FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
         ) STRICT;
         CREATE TABLE leases (
             run_id TEXT NOT NULL,
             effect_id TEXT NOT NULL,
-            worker_id TEXT NOT NULL,
-            fence INTEGER NOT NULL,
+            worker_id TEXT NOT NULL CHECK(length(worker_id) > 0),
+            fence INTEGER NOT NULL CHECK(fence > 0),
             expires_at TEXT NOT NULL,
             PRIMARY KEY (run_id, effect_id),
             FOREIGN KEY (run_id, effect_id) REFERENCES effects(run_id, effect_id)
+                ON DELETE RESTRICT
         ) STRICT;
         CREATE TABLE events (
             event_id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id TEXT NOT NULL,
-            revision INTEGER NOT NULL,
-            event TEXT NOT NULL,
-            state TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            event TEXT NOT NULL CHECK(event IN ('DISCOVER', 'DRAFT_REQUIREMENTS', 'APPROVE_GATE_1', 'DESIGN', 'DEFINE_MODULES', 'APPROVE_GATE_2', 'PLAN', 'APPROVE_GATE_3', 'IMPLEMENT', 'VERIFY', 'RELEASE_TEST', 'REQUEST_PRODUCTION', 'RELEASE_PRODUCTION', 'ACCEPT', 'APPROVE_GATE_4', 'INVALIDATE_DEPENDENCY', 'RECORD_INCIDENT', 'CORRECT', 'ROLLBACK', 'ENTER_SAFE_CHECKPOINT')),
+            state TEXT NOT NULL CHECK(state IN ('new', 'discovery', 'requirements', 'gate_1', 'design', 'modules', 'gate_2', 'planning', 'gate_3', 'implementation', 'verification', 'test', 'production_authorization', 'prod', 'acceptance', 'completed', 'incident', 'correction', 'rollback', 'safe_checkpoint')),
             context_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
             UNIQUE (run_id, revision),
-            FOREIGN KEY (run_id) REFERENCES runs(run_id)
+            FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
         ) STRICT;
+        CREATE TRIGGER runs_revision_must_advance
+        BEFORE UPDATE ON runs
+        WHEN NEW.revision != OLD.revision + 1
+        BEGIN SELECT RAISE(ABORT, 'run revision must advance by one'); END;
+        CREATE TRIGGER leases_fence_must_advance
+        BEFORE UPDATE ON leases
+        WHEN NEW.fence <= OLD.fence
+        BEGIN SELECT RAISE(ABORT, 'lease fence must increase'); END;
+        CREATE TRIGGER terminal_effects_are_immutable
+        BEFORE UPDATE ON effects
+        WHEN OLD.state IN ('completed', 'reconciled')
+        BEGIN SELECT RAISE(ABORT, 'terminal effect is immutable'); END;
+        CREATE TRIGGER events_are_immutable_on_update
+        BEFORE UPDATE ON events
+        BEGIN SELECT RAISE(ABORT, 'journal events are immutable'); END;
+        CREATE TRIGGER events_are_immutable_on_delete
+        BEFORE DELETE ON events
+        BEGIN SELECT RAISE(ABORT, 'journal events are immutable'); END;
         PRAGMA user_version = 0;
         """.replace("__REVISION_TYPE__", revision_type)
     connection.executescript(script)
     connection.execute(
         "INSERT INTO runs(run_id, state, revision, updated_at) VALUES (?, ?, ?, ?)",
-        ("legacy-run", "new", 0, "2026-08-11T00:00:00.000000+00:00"),
+        ("run-1", "discovery", 1, "2026-08-11T00:00:00.000000+00:00"),
     )
+    for effect_id, state, evidence in (
+        ("intent-effect", "intent", None),
+        ("started-effect", "started", None),
+        ("completed-effect", "completed", "evidence://completed"),
+        ("reconciled-effect", "reconciled", "evidence://legacy-reconciled"),
+    ):
+        connection.execute(
+            "INSERT INTO effects(run_id, effect_id, kind, state, evidence_ref, created_at, updated_at) "
+            "VALUES ('run-1', ?, 'release', ?, ?, ?, ?)",
+            (
+                effect_id,
+                state,
+                evidence,
+                "2026-08-11T00:00:00.000000+00:00",
+                "2026-08-11T00:00:00.000000+00:00",
+            ),
+        )
+    for effect_id, worker_id, fence in (
+        ("started-effect", "worker-started", 7),
+        ("reconciled-effect", "worker-reconciled", 8),
+    ):
+        connection.execute(
+            "INSERT INTO leases(run_id, effect_id, worker_id, fence, expires_at) "
+            "VALUES ('run-1', ?, ?, ?, '2026-08-11T00:01:00.000000+00:00')",
+            (effect_id, worker_id, fence),
+        )
+    connection.execute(
+        "INSERT INTO events(run_id, revision, event, state, context_json, created_at) "
+        "VALUES ('run-1', 1, 'DISCOVER', 'discovery', '{}', '2026-08-11T00:00:00.000000+00:00')"
+    )
+    connection.commit()
+    connection.close()
+
+
+def rewrite_schema_object(path: Path, kind: str, name: str, sql: str) -> None:
+    """Replace one sqlite_master definition to build a same-shape corrupt fixture."""
+    connection = sqlite3.connect(path)
+    version = connection.execute("PRAGMA schema_version").fetchone()[0]
+    connection.execute("PRAGMA writable_schema = ON")
+    connection.execute(
+        "UPDATE sqlite_master SET sql = ? WHERE type = ? AND name = ?",
+        (sql, kind, name),
+    )
+    connection.execute("PRAGMA writable_schema = OFF")
+    connection.execute(f"PRAGMA schema_version = {version + 1}")
     connection.commit()
     connection.close()
 
@@ -191,13 +272,27 @@ def test_open_is_repeatable_and_enables_sqlite_safety_pragmas(
         connection.close()
 
 
-def test_open_migrates_the_explicit_minimal_v0_fixture(journal_path: Path) -> None:
-    """Would fail if an ordered supported migration lost existing journal state."""
-    create_minimal_v0_database(journal_path)
+def test_open_migrates_real_ba17dca_schema_and_preserves_data(
+    journal_path: Path,
+) -> None:
+    """Would fail if migration did not preserve the real ba17dca journal data."""
+    create_ba17dca_v0_database(journal_path)
 
     migrated = Journal.open(journal_path)
     try:
-        assert migrated.get_run("legacy-run").revision == 0
+        assert migrated.get_run("run-1").revision == 1
+        assert (
+            migrated.get_effect("run-1", "started-effect").state is EffectState.STARTED
+        )
+        assert migrated.get_effect("run-1", "completed-effect").evidence_ref == (
+            "evidence://completed"
+        )
+        assert migrated.get_effect("run-1", "reconciled-effect").state is (
+            EffectState.RECONCILED
+        )
+        assert migrated.list_reconciliations("reconciled-effect")[0].outcome is (
+            ReconciliationOutcome.UNKNOWN
+        )
     finally:
         migrated.close()
 
@@ -210,8 +305,15 @@ def test_open_migrates_the_explicit_minimal_v0_fixture(journal_path: Path) -> No
             ).fetchone()[0]
             == 1
         )
+        assert dict(connection.execute("SELECT effect_id, fence FROM leases")) == {
+            "started-effect": 7,
+            "reconciled-effect": 8,
+        }
     finally:
         connection.close()
+
+    reopened = Journal.open(journal_path)
+    reopened.close()
 
 
 def test_open_rejects_partial_unversioned_ddl_without_modifying_it(
@@ -240,7 +342,7 @@ def test_open_rejects_unknown_v0_with_same_column_names_but_wrong_types(
     journal_path: Path,
 ) -> None:
     """Would fail if column names alone could impersonate the supported v0 fixture."""
-    create_minimal_v0_database(journal_path, revision_type="TEXT")
+    create_ba17dca_v0_database(journal_path, revision_type="TEXT")
 
     with pytest.raises(JournalStorageError, match="unknown or partial"):
         Journal.open(journal_path)
@@ -260,11 +362,12 @@ def test_failed_migration_rolls_back_every_statement(
     journal_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Would fail if migration DDL committed before a later statement failed."""
-    create_minimal_v0_database(journal_path)
+    create_ba17dca_v0_database(journal_path)
+    migration = journal_module._MIGRATIONS[0]
     monkeypatch.setattr(
         journal_module,
         "_MIGRATIONS",
-        {0: ("CREATE TABLE migration_probe(value TEXT) STRICT", "INVALID SQL")},
+        {0: (*migration[:8], "INVALID SQL", *migration[8:])},
     )
 
     with pytest.raises(JournalStorageError, match="migration"):
@@ -278,7 +381,27 @@ def test_failed_migration_rolls_back_every_statement(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        assert "migration_probe" not in tables
+        assert "effects_ba17dca" not in tables
+        assert "leases_ba17dca" not in tables
+        assert (
+            connection.execute(
+                "SELECT state FROM effects WHERE effect_id = 'started-effect'"
+            ).fetchone()[0]
+            == "started"
+        )
+        assert (
+            connection.execute(
+                "SELECT fence FROM leases WHERE effect_id = 'started-effect'"
+            ).fetchone()[0]
+            == 7
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'trigger' AND name = 'terminal_effects_are_immutable'"
+            ).fetchone()[0]
+            == 1
+        )
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
     finally:
         connection.close()
@@ -308,6 +431,72 @@ def test_reopen_rejects_unrecognized_trigger_even_when_version_is_current(
         "CREATE TRIGGER rogue_run_trigger BEFORE INSERT ON runs "
         "BEGIN SELECT RAISE(ABORT, 'rogue'); END"
     )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(JournalStorageError, match="schema validation"):
+        Journal.open(journal_path)
+
+
+def test_reopen_rejects_same_name_trigger_with_empty_body(journal_path: Path) -> None:
+    """Would fail if trigger names hid weakened enforcement bodies."""
+    created = Journal.open(journal_path)
+    created.close()
+    connection = sqlite3.connect(journal_path)
+    connection.execute("DROP TRIGGER terminal_effects_are_immutable")
+    connection.execute(
+        "CREATE TRIGGER terminal_effects_are_immutable BEFORE UPDATE ON effects "
+        "BEGIN SELECT 1; END"
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(JournalStorageError, match="schema validation"):
+        Journal.open(journal_path)
+
+
+def test_reopen_rejects_effects_table_without_check_or_foreign_key(
+    journal_path: Path,
+) -> None:
+    """Would fail if matching column signatures hid removed CHECK and FK semantics."""
+    created = Journal.open(journal_path)
+    created.close()
+    rewrite_schema_object(
+        journal_path,
+        "table",
+        "effects",
+        """CREATE TABLE effects (
+            run_id TEXT NOT NULL,
+            effect_id TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL,
+            state TEXT NOT NULL,
+            evidence_ref TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (run_id, effect_id)
+        ) STRICT""",
+    )
+
+    with pytest.raises(JournalStorageError, match="schema validation"):
+        Journal.open(journal_path)
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "CREATE INDEX idx_effects_run_state ON effects(state)",
+        "CREATE UNIQUE INDEX idx_effects_run_state ON effects(run_id, state)",
+    ],
+)
+def test_reopen_rejects_same_name_index_with_wrong_columns_or_uniqueness(
+    journal_path: Path, replacement: str
+) -> None:
+    """Would fail if index names hid wrong columns or uniqueness semantics."""
+    created = Journal.open(journal_path)
+    created.close()
+    connection = sqlite3.connect(journal_path)
+    connection.execute("DROP INDEX idx_effects_run_state")
+    connection.execute(replacement)
     connection.commit()
     connection.close()
 
@@ -359,6 +548,114 @@ def test_clock_rollback_across_reopen_is_rejected_before_lease_decision(
             )
     finally:
         reopened.close()
+
+
+def test_future_lease_held_result_commits_watermark_before_raising(
+    journal_path: Path, clock: MutableClock
+) -> None:
+    """Would fail if an expected LeaseHeld rolled back the newly observed max time."""
+    first = Journal.open(journal_path, clock=clock)
+    seed_effect(first)
+    first.acquire_attempt("run-1", "deploy-1", "worker-a", timedelta(minutes=10))
+    clock.advance(timedelta(minutes=5))
+    with pytest.raises(LeaseHeld):
+        first.acquire_attempt("run-1", "deploy-1", "worker-b", timedelta(minutes=1))
+    first.close()
+    clock.now -= timedelta(minutes=4)
+
+    reopened = Journal.open(journal_path, clock=clock)
+    try:
+        with pytest.raises(JournalError, match="clock moved backwards"):
+            reopened.acquire_attempt(
+                "run-1", "deploy-1", "worker-b", timedelta(minutes=1)
+            )
+    finally:
+        reopened.close()
+
+
+def test_clock_rollback_rejects_old_owner_effect_mutation(
+    journal: Journal, clock: MutableClock
+) -> None:
+    """Would fail if wall-clock rollback let an owner extend STARTED authority."""
+    seed_effect(journal)
+    lease = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(minutes=1)
+    )
+    clock.now -= timedelta(seconds=1)
+
+    with pytest.raises(JournalError, match="clock moved backwards"):
+        journal.record_effect("deploy-1", lease.fence, EffectState.STARTED, None)
+
+    assert journal.get_effect("run-1", "deploy-1").state is EffectState.INTENT
+
+
+def test_clock_rollback_rejects_old_owner_reconciliation_mutation(
+    journal: Journal, clock: MutableClock
+) -> None:
+    """Would fail if wall-clock rollback could append a reconciliation outcome."""
+    seed_effect(journal)
+    lease = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(minutes=1)
+    )
+    journal.record_effect("deploy-1", lease.fence, EffectState.STARTED, None)
+    clock.now -= timedelta(seconds=1)
+
+    with pytest.raises(JournalError, match="clock moved backwards"):
+        journal.record_reconciliation(
+            "deploy-1",
+            lease.fence,
+            ReconciliationOutcome.UNKNOWN,
+            "probe://timeout",
+        )
+
+    assert journal.list_reconciliations("deploy-1") == ()
+
+
+def test_exact_same_observed_time_allows_effect_and_reconciliation_mutations(
+    journal: Journal,
+) -> None:
+    """Would fail if equality with the watermark were mistaken for rollback."""
+    seed_effect(journal)
+    lease = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(minutes=1)
+    )
+    journal.record_effect("deploy-1", lease.fence, EffectState.STARTED, None)
+    journal.record_reconciliation(
+        "deploy-1",
+        lease.fence,
+        ReconciliationOutcome.UNKNOWN,
+        "probe://same-time",
+    )
+
+    assert journal.list_reconciliations("deploy-1")[0].outcome is (
+        ReconciliationOutcome.UNKNOWN
+    )
+
+
+def test_each_authority_action_samples_clock_exactly_once(journal_path: Path) -> None:
+    """Would fail if one decision compared or stored different clock samples."""
+    clock = AdvancingClock()
+    journal = Journal.open(journal_path, clock=clock)
+    seed_effect(journal, "effect-1")
+    clock.calls = 0
+    first = journal.acquire_attempt(
+        "run-1", "effect-1", "worker-a", timedelta(minutes=1)
+    )
+    assert clock.calls == 1
+
+    clock.calls = 0
+    journal.record_effect("effect-1", first.fence, EffectState.STARTED, None)
+    assert clock.calls == 1
+
+    clock.calls = 0
+    journal.record_reconciliation(
+        "effect-1",
+        first.fence,
+        ReconciliationOutcome.UNKNOWN,
+        "probe://single-sample",
+    )
+    assert clock.calls == 1
+    journal.close()
 
 
 def test_exact_lease_expiry_is_available_for_takeover(
@@ -543,7 +840,7 @@ def test_observed_completed_reconciliation_requires_and_immutably_stores_evidenc
             None,
         )
 
-    journal.record_reconciliation(
+    committed = journal.record_reconciliation(
         "deploy-1",
         lease.fence,
         ReconciliationOutcome.OBSERVED_COMPLETED,
@@ -552,6 +849,15 @@ def test_observed_completed_reconciliation_requires_and_immutably_stores_evidenc
     assert journal.get_effect("run-1", "deploy-1").state is EffectState.COMPLETED
     assert journal.list_reconciliations("deploy-1")[0].outcome is (
         ReconciliationOutcome.OBSERVED_COMPLETED
+    )
+    assert (
+        journal.record_reconciliation(
+            "deploy-1",
+            lease.fence,
+            ReconciliationOutcome.OBSERVED_COMPLETED,
+            "probe://completed-receipt",
+        )
+        == committed
     )
 
     with pytest.raises(EffectConflict):
@@ -617,6 +923,126 @@ def test_unknown_reconciliation_blocks_dispatch_and_remains_auditable(
     assert journal.list_reconciliations("deploy-1")[0].outcome is (
         ReconciliationOutcome.UNKNOWN
     )
+
+
+def test_unknown_reconciliation_lost_ack_replay_survives_expired_lease(
+    journal: Journal, clock: MutableClock
+) -> None:
+    """Would fail if replay consulted the now-terminal effect before its audit row."""
+    seed_effect(journal)
+    lease = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(seconds=1)
+    )
+    journal.record_effect("deploy-1", lease.fence, EffectState.STARTED, None)
+    committed = journal.record_reconciliation(
+        "deploy-1",
+        lease.fence,
+        ReconciliationOutcome.UNKNOWN,
+        "probe://timeout",
+    )
+    clock.advance(timedelta(seconds=2))
+
+    replayed = journal.record_reconciliation(
+        "deploy-1",
+        lease.fence,
+        ReconciliationOutcome.UNKNOWN,
+        "probe://timeout",
+    )
+
+    assert replayed == committed
+    assert journal.list_reconciliations("deploy-1") == (committed,)
+
+
+def test_absent_reconciliation_lost_ack_replay_survives_state_change(
+    journal: Journal,
+) -> None:
+    """Would fail if an absent ACK replay were rejected after restoring intent."""
+    seed_effect(journal)
+    lease = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(minutes=1)
+    )
+    journal.record_effect("deploy-1", lease.fence, EffectState.STARTED, None)
+    committed = journal.record_reconciliation(
+        "deploy-1",
+        lease.fence,
+        ReconciliationOutcome.OBSERVED_ABSENT,
+        "probe://absent-receipt",
+    )
+
+    replayed = journal.record_reconciliation(
+        "deploy-1",
+        lease.fence,
+        ReconciliationOutcome.OBSERVED_ABSENT,
+        "probe://absent-receipt",
+    )
+
+    assert replayed == committed
+    assert journal.list_reconciliations("deploy-1") == (committed,)
+
+
+def test_conflicting_reconciliation_lost_ack_replay_is_rejected(
+    journal: Journal,
+) -> None:
+    """Would fail if one fence could append contradictory probe conclusions."""
+    seed_effect(journal)
+    lease = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(minutes=1)
+    )
+    journal.record_effect("deploy-1", lease.fence, EffectState.STARTED, None)
+    committed = journal.record_reconciliation(
+        "deploy-1",
+        lease.fence,
+        ReconciliationOutcome.UNKNOWN,
+        "probe://timeout",
+    )
+
+    with pytest.raises(EffectConflict, match="conflicts with durable reconciliation"):
+        journal.record_reconciliation(
+            "deploy-1",
+            lease.fence,
+            ReconciliationOutcome.OBSERVED_ABSENT,
+            "probe://absent-receipt",
+        )
+
+    assert journal.list_reconciliations("deploy-1") == (committed,)
+
+
+def test_old_absent_ack_replay_after_new_fence_has_no_side_effect(
+    journal: Journal,
+) -> None:
+    """Would fail if old ACK replay changed the newly fenced retry authority."""
+    seed_effect(journal)
+    first = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(minutes=1)
+    )
+    journal.record_effect("deploy-1", first.fence, EffectState.STARTED, None)
+    committed = journal.record_reconciliation(
+        "deploy-1",
+        first.fence,
+        ReconciliationOutcome.OBSERVED_ABSENT,
+        "probe://absent-receipt",
+    )
+    retry = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-b", timedelta(minutes=1)
+    )
+
+    replayed = journal.record_reconciliation(
+        "deploy-1",
+        first.fence,
+        ReconciliationOutcome.OBSERVED_ABSENT,
+        "probe://absent-receipt",
+    )
+
+    assert replayed == committed
+    assert retry.fence > first.fence
+    assert (
+        journal.acquire_attempt(
+            "run-1", "deploy-1", "worker-b", timedelta(minutes=1)
+        ).fence
+        == retry.fence
+    )
+    assert journal.get_effect("run-1", "deploy-1").state is EffectState.INTENT
+    assert journal.list_reconciliations("deploy-1") == (committed,)
 
 
 def test_two_recovery_workers_cannot_both_acquire_dispatch_lease(

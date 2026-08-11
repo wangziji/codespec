@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator, Mapping
@@ -304,9 +305,127 @@ def _sql_statements(script: str) -> tuple[str, ...]:
     return tuple(statements)
 
 
+def _normalize_schema_sql(statement: str) -> str:
+    normalized = re.sub(r"\bif\s+not\s+exists\b", "", statement, flags=re.IGNORECASE)
+    return " ".join(normalized.lower().strip().removesuffix(";").split())
+
+
+def _sql_manifest(
+    statements: tuple[str, ...],
+) -> dict[tuple[str, str], str]:
+    manifest: dict[tuple[str, str], str] = {}
+    pattern = re.compile(
+        r"^create\s+(table|index|trigger)\s+(?:if\s+not\s+exists\s+)?([^\s(]+)",
+        re.IGNORECASE,
+    )
+    for statement in statements:
+        match = pattern.match(statement.strip())
+        if match is not None:
+            manifest[(match.group(1).lower(), match.group(2).strip('"').lower())] = (
+                _normalize_schema_sql(statement)
+            )
+    return manifest
+
+
 _CURRENT_SCHEMA_VERSION = 1
 _CURRENT_SCHEMA_STATEMENTS = _sql_statements(_SCHEMA)
-_MIGRATIONS: dict[int, tuple[str, ...]] = {0: _CURRENT_SCHEMA_STATEMENTS}
+_CURRENT_SQL_MANIFEST = _sql_manifest(_CURRENT_SCHEMA_STATEMENTS)
+
+_BA17_EFFECTS_SQL = """
+CREATE TABLE effects (
+    run_id TEXT NOT NULL,
+    effect_id TEXT NOT NULL UNIQUE CHECK(length(effect_id) > 0),
+    kind TEXT NOT NULL CHECK(length(kind) > 0),
+    state TEXT NOT NULL CHECK(state IN ('intent', 'started', 'completed', 'reconciled')),
+    evidence_ref TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, effect_id),
+    CHECK (
+        (state IN ('intent', 'started') AND evidence_ref IS NULL)
+        OR
+        (state IN ('completed', 'reconciled') AND length(evidence_ref) > 0)
+    ),
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
+) STRICT
+"""
+_BA17_LEASE_TRIGGER_SQL = """
+CREATE TRIGGER leases_fence_must_advance
+BEFORE UPDATE ON leases
+WHEN NEW.fence <= OLD.fence
+BEGIN SELECT RAISE(ABORT, 'lease fence must increase'); END
+"""
+_BA17_TERMINAL_TRIGGER_SQL = """
+CREATE TRIGGER terminal_effects_are_immutable
+BEFORE UPDATE ON effects
+WHEN OLD.state IN ('completed', 'reconciled')
+BEGIN SELECT RAISE(ABORT, 'terminal effect is immutable'); END
+"""
+_BA17_OBJECT_KEYS = frozenset(
+    {
+        ("table", "runs"),
+        ("table", "effects"),
+        ("table", "leases"),
+        ("table", "events"),
+        ("trigger", "runs_revision_must_advance"),
+        ("trigger", "leases_fence_must_advance"),
+        ("trigger", "terminal_effects_are_immutable"),
+        ("trigger", "events_are_immutable_on_update"),
+        ("trigger", "events_are_immutable_on_delete"),
+    }
+)
+_BA17_SQL_MANIFEST = {
+    key: value
+    for key, value in _CURRENT_SQL_MANIFEST.items()
+    if key in _BA17_OBJECT_KEYS
+}
+_BA17_SQL_MANIFEST[("table", "effects")] = _normalize_schema_sql(_BA17_EFFECTS_SQL)
+_BA17_SQL_MANIFEST[("trigger", "leases_fence_must_advance")] = _normalize_schema_sql(
+    _BA17_LEASE_TRIGGER_SQL
+)
+_BA17_SQL_MANIFEST[("trigger", "terminal_effects_are_immutable")] = (
+    _normalize_schema_sql(_BA17_TERMINAL_TRIGGER_SQL)
+)
+
+_BA17_TO_V1_STATEMENTS = (
+    "DROP TRIGGER runs_revision_must_advance",
+    "DROP TRIGGER leases_fence_must_advance",
+    "DROP TRIGGER terminal_effects_are_immutable",
+    "DROP TRIGGER events_are_immutable_on_update",
+    "DROP TRIGGER events_are_immutable_on_delete",
+    "ALTER TABLE leases RENAME TO leases_ba17dca",
+    "ALTER TABLE effects RENAME TO effects_ba17dca",
+    *_CURRENT_SCHEMA_STATEMENTS,
+    """INSERT INTO effects(
+        run_id, effect_id, kind, state, evidence_ref, created_at, updated_at
+    )
+    SELECT run_id, effect_id, kind, state,
+           CASE WHEN state = 'reconciled' THEN NULL ELSE evidence_ref END,
+           created_at, updated_at
+    FROM effects_ba17dca""",
+    """INSERT INTO reconciliations(
+        run_id, effect_id, fence, outcome, evidence_ref, observed_at
+    )
+    SELECT e.run_id, e.effect_id, 0, 'unknown', e.evidence_ref, e.updated_at
+    FROM effects_ba17dca e
+    LEFT JOIN leases_ba17dca l
+      ON l.run_id = e.run_id AND l.effect_id = e.effect_id
+    WHERE e.state = 'reconciled' AND l.effect_id IS NULL""",
+    """INSERT INTO leases(run_id, effect_id, worker_id, fence, expires_at)
+    SELECT run_id, effect_id, worker_id, fence, expires_at
+    FROM leases_ba17dca""",
+    """INSERT INTO reconciliations(
+        run_id, effect_id, fence, outcome, evidence_ref, observed_at
+    )
+    SELECT e.run_id, e.effect_id, l.fence, 'unknown', e.evidence_ref, e.updated_at
+    FROM effects_ba17dca e
+    JOIN leases_ba17dca l
+      ON l.run_id = e.run_id AND l.effect_id = e.effect_id
+    WHERE e.state = 'reconciled'""",
+    "DROP TABLE leases_ba17dca",
+    "DROP TABLE effects_ba17dca",
+)
+_MIGRATIONS: dict[int, tuple[str, ...]] = {0: _BA17_TO_V1_STATEMENTS}
 
 _V0_COLUMN_SIGNATURES = {
     "runs": (
@@ -370,6 +489,54 @@ _CURRENT_TRIGGERS = frozenset(
         "reconciliations_are_immutable_on_delete",
     }
 )
+_CURRENT_INDEX_MANIFEST = {
+    "journal_metadata": frozenset(),
+    "runs": frozenset({(1, "pk", 0, ("run_id",))}),
+    "effects": frozenset(
+        {
+            (1, "u", 0, ("effect_id",)),
+            (1, "pk", 0, ("run_id", "effect_id")),
+            (0, "c", 0, ("run_id", "state")),
+        }
+    ),
+    "leases": frozenset({(1, "pk", 0, ("run_id", "effect_id"))}),
+    "events": frozenset({(1, "u", 0, ("run_id", "revision"))}),
+    "reconciliations": frozenset(
+        {
+            (1, "u", 0, ("effect_id", "fence", "outcome", "evidence_ref")),
+            (0, "c", 0, ("effect_id", "reconciliation_id")),
+        }
+    ),
+}
+_BA17_INDEX_MANIFEST = {
+    "runs": _CURRENT_INDEX_MANIFEST["runs"],
+    "effects": frozenset(
+        {
+            (1, "u", 0, ("effect_id",)),
+            (1, "pk", 0, ("run_id", "effect_id")),
+        }
+    ),
+    "leases": _CURRENT_INDEX_MANIFEST["leases"],
+    "events": _CURRENT_INDEX_MANIFEST["events"],
+}
+_CURRENT_FOREIGN_KEYS = {
+    "journal_metadata": (),
+    "runs": (),
+    "effects": ((0, 0, "runs", "run_id", "run_id", "NO ACTION", "RESTRICT", "NONE"),),
+    "leases": (
+        (0, 0, "effects", "run_id", "run_id", "NO ACTION", "RESTRICT", "NONE"),
+        (0, 1, "effects", "effect_id", "effect_id", "NO ACTION", "RESTRICT", "NONE"),
+    ),
+    "events": ((0, 0, "runs", "run_id", "run_id", "NO ACTION", "RESTRICT", "NONE"),),
+    "reconciliations": (
+        (0, 0, "effects", "run_id", "run_id", "NO ACTION", "RESTRICT", "NONE"),
+        (0, 1, "effects", "effect_id", "effect_id", "NO ACTION", "RESTRICT", "NONE"),
+    ),
+}
+_BA17_FOREIGN_KEYS = {
+    table: _CURRENT_FOREIGN_KEYS[table]
+    for table in ("runs", "effects", "leases", "events")
+}
 
 
 class Journal:
@@ -557,7 +724,11 @@ class Journal:
         _require_identifier("worker_id", worker_id)
         if not isinstance(ttl, timedelta) or ttl < timedelta(0):
             raise ValueError("ttl must be a non-negative timedelta")
+        lease: Lease | None = None
+        pending_error: JournalError | None = None
         with self._transaction():
+            now = self._now()
+            _advance_observed_time(self._connection, now)
             effect = self._connection.execute(
                 "SELECT state FROM effects WHERE run_id = ? AND effect_id = ?",
                 (run_id, effect_id),
@@ -572,8 +743,6 @@ class Journal:
                     f"effect {effect_id} is already {effect_state.value}"
                 )
 
-            now = self._now()
-            _advance_observed_time(self._connection, now)
             current = self._connection.execute(
                 "SELECT worker_id, fence, expires_at FROM leases "
                 "WHERE run_id = ? AND effect_id = ?",
@@ -581,46 +750,51 @@ class Journal:
             ).fetchone()
             if current is not None and _parse_time(current["expires_at"]) > now:
                 if current["worker_id"] != worker_id:
-                    raise LeaseHeld(
+                    pending_error = LeaseHeld(
                         f"effect {effect_id} is leased by {current['worker_id']}"
                     )
-                return Lease(
+                else:
+                    lease = Lease(
+                        run_id,
+                        effect_id,
+                        worker_id,
+                        current["fence"],
+                        _parse_time(current["expires_at"]),
+                        effect_state is EffectState.INTENT,
+                    )
+            else:
+                fence = 1 if current is None else current["fence"] + 1
+                expires_at = now + ttl
+                if current is None:
+                    self._connection.execute(
+                        "INSERT INTO leases(run_id, effect_id, worker_id, fence, expires_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (run_id, effect_id, worker_id, fence, _format_time(expires_at)),
+                    )
+                else:
+                    self._connection.execute(
+                        "UPDATE leases SET worker_id = ?, fence = ?, expires_at = ? "
+                        "WHERE run_id = ? AND effect_id = ?",
+                        (
+                            worker_id,
+                            fence,
+                            _format_time(expires_at),
+                            run_id,
+                            effect_id,
+                        ),
+                    )
+                lease = Lease(
                     run_id,
                     effect_id,
                     worker_id,
-                    current["fence"],
-                    _parse_time(current["expires_at"]),
+                    fence,
+                    expires_at,
                     effect_state is EffectState.INTENT,
                 )
-
-            fence = 1 if current is None else current["fence"] + 1
-            expires_at = now + ttl
-            if current is None:
-                self._connection.execute(
-                    "INSERT INTO leases(run_id, effect_id, worker_id, fence, expires_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (run_id, effect_id, worker_id, fence, _format_time(expires_at)),
-                )
-            else:
-                self._connection.execute(
-                    "UPDATE leases SET worker_id = ?, fence = ?, expires_at = ? "
-                    "WHERE run_id = ? AND effect_id = ?",
-                    (
-                        worker_id,
-                        fence,
-                        _format_time(expires_at),
-                        run_id,
-                        effect_id,
-                    ),
-                )
-            return Lease(
-                run_id,
-                effect_id,
-                worker_id,
-                fence,
-                expires_at,
-                effect_state is EffectState.INTENT,
-            )
+        if pending_error is not None:
+            raise pending_error
+        assert lease is not None
+        return lease
 
     def record_effect(
         self,
@@ -637,6 +811,8 @@ class Journal:
         except (TypeError, ValueError) as error:
             raise EffectConflict("unknown effect state") from error
         with self._transaction():
+            now = self._now()
+            _advance_observed_time(self._connection, now)
             row = self._connection.execute(
                 "SELECT e.run_id, e.state, e.evidence_ref, l.fence, l.expires_at "
                 "FROM effects e LEFT JOIN leases l "
@@ -663,7 +839,7 @@ class Journal:
             if (
                 row["fence"] is None
                 or row["fence"] != fence
-                or _parse_time(row["expires_at"]) <= self._now()
+                or _parse_time(row["expires_at"]) <= now
             ):
                 raise StaleFence(f"fence {fence} is not current for effect {effect_id}")
 
@@ -694,7 +870,7 @@ class Journal:
             self._connection.execute(
                 "UPDATE effects SET state = ?, evidence_ref = ?, updated_at = ? "
                 "WHERE effect_id = ?",
-                (target.value, evidence_ref, _format_time(self._now()), effect_id),
+                (target.value, evidence_ref, _format_time(now), effect_id),
             )
 
     def record_reconciliation(
@@ -717,6 +893,25 @@ class Journal:
             )
 
         with self._transaction():
+            now = self._now()
+            _advance_observed_time(self._connection, now)
+            prior_reconciliations = self._connection.execute(
+                "SELECT reconciliation_id, run_id, effect_id, fence, outcome, "
+                "evidence_ref, observed_at FROM reconciliations "
+                "WHERE effect_id = ? AND fence = ? ORDER BY reconciliation_id",
+                (effect_id, fence),
+            ).fetchall()
+            if prior_reconciliations:
+                if len(prior_reconciliations) == 1:
+                    prior = prior_reconciliations[0]
+                    if (
+                        prior["outcome"] == normalized_outcome.value
+                        and prior["evidence_ref"] == evidence_ref
+                    ):
+                        return _reconciliation_from_row(prior)
+                raise EffectConflict(
+                    "reconciliation conflicts with durable reconciliation"
+                )
             row = self._connection.execute(
                 "SELECT e.run_id, e.state, e.evidence_ref, l.fence, l.expires_at "
                 "FROM effects e LEFT JOIN leases l "
@@ -732,24 +927,11 @@ class Journal:
                     raise StaleFence(
                         f"fence {fence} did not commit terminal effect {effect_id}"
                     )
-                if (
-                    normalized_outcome is ReconciliationOutcome.OBSERVED_COMPLETED
-                    and row["evidence_ref"] == evidence_ref
-                ):
-                    existing = self._connection.execute(
-                        "SELECT reconciliation_id, run_id, effect_id, fence, outcome, "
-                        "evidence_ref, observed_at FROM reconciliations "
-                        "WHERE effect_id = ? AND fence = ? AND outcome = ? AND evidence_ref = ?",
-                        (effect_id, fence, normalized_outcome.value, evidence_ref),
-                    ).fetchone()
-                    if existing is not None:
-                        return _reconciliation_from_row(existing)
                 raise EffectConflict("completed reconciliation evidence is immutable")
             if current not in {EffectState.STARTED, EffectState.RECONCILED}:
                 raise EffectConflict(
                     f"effect in {current.value} does not require reconciliation"
                 )
-            now = self._now()
             if (
                 row["fence"] is None
                 or row["fence"] != fence
@@ -990,9 +1172,17 @@ def _apply_schema_steps(
 def _is_known_v0(connection: sqlite3.Connection) -> bool:
     if _object_names(connection, "table") != frozenset(_V0_COLUMN_SIGNATURES):
         return False
-    if _object_names(connection, "trigger"):
+    if _database_sql_manifest(connection) != _BA17_SQL_MANIFEST:
         return False
-    if _object_names(connection, "index"):
+    if any(
+        _index_semantics(connection, table) != expected
+        for table, expected in _BA17_INDEX_MANIFEST.items()
+    ):
+        return False
+    if any(
+        _foreign_keys(connection, table) != expected
+        for table, expected in _BA17_FOREIGN_KEYS.items()
+    ):
         return False
     return all(
         _table_signature(connection, table) == signature
@@ -1031,6 +1221,22 @@ def _validate_connection_and_schema(
         raise JournalStorageError("journal schema validation failed: indexes")
     if _CURRENT_TRIGGERS != _object_names(connection, "trigger"):
         raise JournalStorageError("journal schema validation failed: triggers")
+    if _database_sql_manifest(connection) != _CURRENT_SQL_MANIFEST:
+        raise JournalStorageError("journal schema validation failed: object SQL")
+    for table, expected in _CURRENT_INDEX_MANIFEST.items():
+        if _index_semantics(connection, table) != expected:
+            raise JournalStorageError(
+                f"journal schema validation failed: indexes for {table}"
+            )
+    for table, expected in _CURRENT_FOREIGN_KEYS.items():
+        if _foreign_keys(connection, table) != expected:
+            raise JournalStorageError(
+                f"journal schema validation failed: foreign keys for {table}"
+            )
+    if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise JournalStorageError("journal schema validation failed: foreign key data")
+    if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+        raise JournalStorageError("journal schema validation failed: quick check")
     metadata = connection.execute(
         "SELECT schema_version FROM journal_metadata WHERE singleton = 1"
     ).fetchone()
@@ -1055,6 +1261,48 @@ def _table_signature(
     return tuple(
         (row[1], row[2].upper(), row[3], row[5])
         for row in connection.execute(f'PRAGMA table_info("{safe_table}")').fetchall()
+    )
+
+
+def _database_sql_manifest(
+    connection: sqlite3.Connection,
+) -> dict[tuple[str, str], str]:
+    return {
+        (row[0], row[1]): _normalize_schema_sql(row[2])
+        for row in connection.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE type IN ('table', 'index', 'trigger') "
+            "AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL"
+        )
+    }
+
+
+def _index_semantics(
+    connection: sqlite3.Connection, table: str
+) -> frozenset[tuple[int, str, int, tuple[str, ...]]]:
+    safe_table = table.replace('"', '""')
+    result = set()
+    for row in connection.execute(f'PRAGMA index_list("{safe_table}")').fetchall():
+        safe_index = row[1].replace('"', '""')
+        columns = tuple(
+            item[2]
+            for item in connection.execute(
+                f'PRAGMA index_info("{safe_index}")'
+            ).fetchall()
+        )
+        result.add((row[2], row[3], row[4], columns))
+    return frozenset(result)
+
+
+def _foreign_keys(
+    connection: sqlite3.Connection, table: str
+) -> tuple[tuple[object, ...], ...]:
+    safe_table = table.replace('"', '""')
+    return tuple(
+        tuple(row)
+        for row in connection.execute(
+            f'PRAGMA foreign_key_list("{safe_table}")'
+        ).fetchall()
     )
 
 
