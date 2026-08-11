@@ -1,0 +1,34 @@
+schema_version: "1.0"
+policies:
+  - policy_id: worker-analysis-v1
+    capability: worker.analysis
+    operation: read
+    resource_pattern: /approved/worktrees/example
+    allowed_argv_prefix:
+      - /Applications/ChatGPT.app/Contents/Resources/codex
+      - exec
+    required_run_state: discovery
+    approval_digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    actor_class: controller
+    timeout_seconds: 120
+    idempotency_strategy: effect-id
+    reconciliation_strategy: journal-probe
+    # HOME/CODEX_HOME expose only Codex platform authentication. External-service
+    # credentials remain filtered and are never copied into worker context.
+    allowed_environment_names: [HOME, PATH, LANG, LC_ALL, CODEX_HOME]
+    allowed_write_roots: []
+  - policy_id: worker-implementation-v1
+    capability: worker.implementation
+    operation: write
+    resource_pattern: /approved/worktrees/example
+    allowed_argv_prefix:
+      - /Applications/ChatGPT.app/Contents/Resources/codex
+      - exec
+    required_run_state: implementation
+    approval_digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    actor_class: controller
+    timeout_seconds: 120
+    idempotency_strategy: effect-id
+    reconciliation_strategy: journal-probe
+    allowed_environment_names: [HOME, PATH, LANG, LC_ALL, CODEX_HOME]
+    allowed_write_roots: [/approved/worktrees/example]
