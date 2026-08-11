@@ -4,6 +4,8 @@
 
 **目前不存在一个成熟框架，能够单体、原生、可审计地覆盖“需求澄清 → Penpot 交互设计 → 架构/spec → 任务拆解与多代理编码 → 测试 → 部署 → 线上回归 → bug 修复 → 成本路由 → 契约一致性 → 学习/受控进化”的全部流程。**
 
+**2026-08-11 补充核验：** Spec Kit `v0.16.2` 已提供 workflow catalog、`run`、持久状态、`resume`、条件/循环和人工 gate，能力明显超过单纯的 Markdown 规格模板；但其[官方 workflow 文档](https://github.github.com/spec-kit/reference/workflows.html)同时明确指出 shell step 以本地用户权限执行、`requires` 不是 capability sandbox。因此它值得进行固定版本的隔离 spike，但仍不能未经验证就承担本方案的 Trusted Workflow Core、权限代理或唯一执行状态。
+
 现有产品所谓 “end-to-end” 通常只在自身层内成立：Codex/OpenHands 覆盖编码任务，LangGraph/Microsoft Agent Framework/CrewAI 覆盖 agent 应用，Temporal/Argo/Tekton 覆盖工作流或 CI/CD，Backstage/Port 覆盖开发者门户与治理，Spec Kit/OpenSpec 覆盖规格制品。成熟解法应是**分层组合**，并让确定性 CI、契约检查、审批和回滚成为权威门禁；不应把一个自治 agent 当作全流程控制平面。
 
 这里的“成熟度”不是供应商宣传排名，而是根据官方文档中的稳定性声明、持久化/恢复、权限治理、可观测性和明确的 preview/experimental 警告综合判断。
@@ -19,7 +21,7 @@
 | [CrewAI](https://github.com/crewAIInc/crewai) | **活跃、生产导向；成熟度主要来自项目/厂商自述** | Crews 的角色协作；Flows 的事件驱动、状态、条件分支；企业控制面提供观测、RBAC、云/本地部署 | Python 通用 agent 框架而非 SWE/SDLC 系统；spec、设计、Git、CI/CD、部署、契约及沙箱均需另接。Visual Agent Builder 是 agent 配置，不是产品交互设计系统 |
 | [OpenHands](https://github.com/OpenHands/openhands) | **活跃的编码 agent/沙箱底座**；云与企业层另有商业/许可证边界 | 软件 agent SDK、CLI/GUI/cloud、代码执行沙箱、Jira/Linear/Slack 等连接、可扩展多 agent | 适合成为“编码执行器”，不提供从产品设计到线上治理的完整生命周期；云层部署与许可需单独评估（见官方 [OpenHands Cloud](https://github.com/OpenHands/OpenHands-Cloud)） |
 | [SWE-agent](https://github.com/princeton-nlp/SWE-agent/blob/main/docs/index.md) | **研究工具，原项目现为 maintenance-only，不是企业交付平台** | 以 GitHub issue 为输入，在仓库环境中定位和修复问题；ACI 研究价值高 | [官方 CLI 文档](https://swe-agent.com/latest/usage/cli/)说明原 SWE-agent 已被 mini-swe-agent 取代；缺少企业权限、持久交付编排、设计/spec、部署和治理 |
-| [GitHub Spec Kit](https://github.com/github/spec-kit) | **活跃的规格工作流工具；不是运行时平台** | constitution → specify/clarify → plan → tasks → implement；`analyze` 做跨制品一致性检查，`converge` 对照代码与规格补任务，支持 30+ coding agents | 官方仍把 enterprise constraints、鲁棒迭代等列为“experimental goals”；Markdown/模板和 agent 指令不能替代可执行 API/schema 契约、CI、部署、生产回归或 durable execution |
+| [GitHub Spec Kit](https://github.com/github/spec-kit) | **活跃的规格工作流与轻量 workflow runtime；新能力需谨慎验证** | constitution → specify/clarify → plan → tasks → implement；`analyze`/`converge` 做跨制品一致性；`v0.16.2` 提供 workflow catalog、分支/循环/gate、持久状态与 resume | workflow shell step 没有 capability sandbox，也未替代可执行 API/schema 契约、CI、部署、生产回归、外部副作用幂等/补偿或可信审批绑定；不能直接承担完整 SDLC 控制平面 |
 | [OpenSpec](https://github.com/Fission-AI/OpenSpec) | **活跃、轻量、偏 brownfield 的规格制品层**；跨 repo Stores 仍为 beta | explore/propose/apply/verify/archive；proposal、requirements/scenarios、design、tasks 的 Git 化变更包；可跨多个 coding agents | 流程刻意“fluid not rigid”，因此强门禁需外加；Stores 明示 beta。它不执行 CI/CD、生产观测和跨系统恢复，也不能单靠 Markdown 防止实现/接口漂移 |
 | [Temporal](https://docs.temporal.io/) | **成熟的 durable execution 组件** | 持久事件历史、故障后恢复、长时间等待、重试、补偿和跨系统审批；适合把需求批准、部署、回滚、回归等串成可恢复业务流程 | 没有 agent 推理、代码理解、spec 或设计语义；活动、权限、幂等性和版本迁移均需工程实现。不要把非确定性 LLM 直接放进要求可重放的 workflow 逻辑 |
 | [Argo Workflows](https://argo-workflows.readthedocs.io/en/latest/walk-through/dag/) / [Tekton](https://tekton.dev/docs/pipelines/) | **成熟的 Kubernetes 工作流/CI-CD 组件** | DAG/fan-out/fan-in、容器任务、重试、Kubernetes 原生交付；适合测试、构建、发布、回归执行 | DAG 不天然表达开放式反馈循环；没有 agent 状态、产品需求、设计或学习治理。更适合做“确定性执行面”，而不是自治决策面 |
@@ -71,4 +73,4 @@ GitHub Project + Penpot + OpenSpec/Spec Kit
 
 如果目标是 Codex 大型项目交付，最稳妥的形态不是寻找“一个会自我进化的全能框架”，而是建立一条**制品可追踪、状态可恢复、门禁确定性、agent 可替换**的组合流水线。Codex 是高能力 worker/supervisor；spec、设计、CI、部署和治理分别由各自权威系统负责。
 
-以上结论基于截至 2026-08-10 可公开访问的官方文档、原始仓库和一手研究。没有独立审计各厂商的生产承诺；不同语言 SDK、套餐、cloud/self-hosted 版本的可用性可能不同，尤其是 Microsoft Agent Framework prerelease 功能、OpenSpec Stores beta、Backstage experimental recovery、Penpot MCP 多用户模式以及 GitHub Copilot 的 preview 扩展。正式选型应按目标部署形态重新核验精确版本和许可证。
+主体结论基于截至 2026-08-10 可公开访问的官方文档、原始仓库和一手研究，Spec Kit 补充核验截至 2026-08-11。没有独立审计各厂商的生产承诺；不同语言 SDK、套餐、cloud/self-hosted 版本的可用性可能不同，尤其是 Microsoft Agent Framework prerelease 功能、OpenSpec Stores beta、Backstage experimental recovery、Penpot MCP 多用户模式以及 GitHub Copilot 的 preview 扩展。正式选型应按目标部署形态重新核验精确版本和许可证。
