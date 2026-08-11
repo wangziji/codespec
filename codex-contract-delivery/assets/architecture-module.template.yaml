@@ -1,0 +1,9 @@
+schema_version: "1.0"
+module_id: "<module-id>"
+business_capability: "<capability>"
+data_owners: ["<owner-record>"]
+interfaces: ["<interface-record>"]
+submodules:
+  - module_id: "<submodule-id>"
+    test_boundary: "<independent-test-boundary>"
+    context_budget: 1

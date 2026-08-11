@@ -1,0 +1,12 @@
+schema_version: "1.0"
+project: "<penpot-project>"
+file: "<penpot-file>"
+page: "<penpot-page>"
+frame: "<penpot-frame>"
+revision: "<revision-or-snapshot-digest>"
+scenarios: []
+route: "<route>"
+states: []
+breakpoints: []
+components: []
+tokens: []
