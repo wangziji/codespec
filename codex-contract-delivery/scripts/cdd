@@ -1,0 +1,11 @@
+#!/usr/bin/env sh
+set -eu
+
+SKILL_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+COMMAND_NAME=$(basename -- "$0")
+
+if [ "$COMMAND_NAME" = "cdd" ]; then
+  exec uv run --locked --project "$SKILL_ROOT" cdd "$@"
+fi
+
+exec uv run --locked --project "$SKILL_ROOT" cdd "$COMMAND_NAME" "$@"

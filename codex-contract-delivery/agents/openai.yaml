@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Contract Delivery"
+  short_description: "Governed contract delivery phases"
+  default_prompt: "Use $codex-contract-delivery to deliver this change through its current trusted phase."
