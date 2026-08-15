@@ -905,7 +905,15 @@ class CapabilityBroker:
         )
         return grant
 
-    def _validate_grant(self, grant: Grant) -> None:
+    def _validate_grant(
+        self, grant: Grant, *, minimum_validity_seconds: float = 0.0
+    ) -> None:
+        if (
+            not isinstance(minimum_validity_seconds, int | float)
+            or isinstance(minimum_validity_seconds, bool)
+            or minimum_validity_seconds < 0
+        ):
+            raise ValueError("minimum grant validity must be non-negative")
         if not isinstance(grant, Grant) or not grant.verify_digest():
             self._deny("invalid-grant", "grant-digest", "grant digest is invalid")
         if self._issued.get(grant.grant_id) != grant:
@@ -928,6 +936,14 @@ class CapabilityBroker:
         now = self._clock()
         if now >= grant.expires_at:
             self._deny(grant.request_digest, "grant-expired", "grant expired")
+        minimum_valid_until = now + timedelta(seconds=minimum_validity_seconds)
+        if minimum_valid_until >= grant.expires_at:
+            self._deny(
+                grant.request_digest,
+                "grant-deadline",
+                "grant does not cover the bounded commit deadline",
+                grant=grant,
+            )
         required_lease_until = now + timedelta(
             seconds=(grant.timeout_seconds + _TERM_GRACE_SECONDS + _KILL_GRACE_SECONDS)
         )
@@ -1326,7 +1342,7 @@ class CapabilityBroker:
         prior_stage_ref: str,
         adopted_stage_ref: str,
         prepared: object,
-        committer: Callable[[object, Callable[[], None]], object],
+        committer: Callable[[object, Callable[[float], None]], object],
     ) -> tuple[EffectResult, object | None]:
         """Adopt and commit a staged result without re-running the worker."""
         self._validate_grant(grant)
@@ -1351,13 +1367,14 @@ class CapabilityBroker:
                 None,
             )
 
-        def validate_commit_authority() -> None:
-            self._validate_grant(grant)
+        def validate_commit_authority(required_seconds: float) -> None:
+            self._validate_grant(grant, minimum_validity_seconds=required_seconds)
             self.journal.record_effect(
                 grant.effect_id,
                 grant.fence,
                 EffectState.PREPARED,
                 adopted_stage_ref,
+                minimum_lease_ttl=timedelta(seconds=required_seconds),
             )
 
         try:
@@ -1405,7 +1422,8 @@ class CapabilityBroker:
             [subprocess.CompletedProcess[str]], tuple[str, object]
         ]
         | None = None,
-        result_committer: Callable[[object, Callable[[], None]], object] | None = None,
+        result_committer: Callable[[object, Callable[[float], None]], object]
+        | None = None,
         sandbox_read_roots: tuple[str, ...] = (),
     ) -> tuple[EffectResult, object | None]:
         self._validate_grant(grant)
@@ -1551,13 +1569,14 @@ class CapabilityBroker:
                     prepared,
                 )
 
-            def validate_commit_authority() -> None:
-                self._validate_grant(grant)
+            def validate_commit_authority(required_seconds: float) -> None:
+                self._validate_grant(grant, minimum_validity_seconds=required_seconds)
                 self.journal.record_effect(
                     grant.effect_id,
                     grant.fence,
                     EffectState.PREPARED,
                     prepared_ref,
+                    minimum_lease_ttl=timedelta(seconds=required_seconds),
                 )
 
             try:

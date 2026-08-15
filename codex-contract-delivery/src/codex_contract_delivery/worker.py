@@ -109,7 +109,7 @@ class WorkerBackend(Protocol):
         self,
         task: WorkerTask,
         prepared: object,
-        authority_check: Callable[[], None],
+        authority_check: Callable[[float], None],
     ) -> tuple[str, ...]: ...
 
     def adopt_export(self, prepared: object, fence: int) -> object: ...
@@ -265,7 +265,11 @@ class WorkerLauncher:
         )
 
     @staticmethod
-    def _path_signature(path: Path) -> str:
+    def _path_signature(
+        path: Path, *, progress_check: Callable[[], None] | None = None
+    ) -> str:
+        if progress_check is not None:
+            progress_check()
         details = path.lstat()
         mode = stat.S_IMODE(details.st_mode)
         if path.is_symlink():
@@ -276,20 +280,35 @@ class WorkerLauncher:
             digest = sha256()
             with path.open("rb") as stream:
                 while chunk := stream.read(1024 * 1024):
+                    if progress_check is not None:
+                        progress_check()
                     digest.update(chunk)
             return f"file:{mode:o}:{details.st_size}:{digest.hexdigest()}"
         return f"other:{details.st_mode:o}:{details.st_size}"
 
     @classmethod
     def _manifest(
-        cls, root: Path, *, skip_root_git: bool = False
+        cls,
+        root: Path,
+        *,
+        skip_root_git: bool = False,
+        progress_check: Callable[[], None] | None = None,
     ) -> tuple[tuple[str, str], ...]:
+        if progress_check is not None:
+            progress_check()
         if not root.exists() and not root.is_symlink():
             return ()
         entries: list[tuple[str, str]] = []
         if not root.is_dir() or root.is_symlink():
-            return ((root.name, cls._path_signature(root)),)
+            return (
+                (
+                    root.name,
+                    cls._path_signature(root, progress_check=progress_check),
+                ),
+            )
         for directory, directory_names, file_names in os.walk(root, followlinks=False):
+            if progress_check is not None:
+                progress_check()
             current = Path(directory)
             for name in sorted((*directory_names, *file_names)):
                 candidate = current / name
@@ -298,7 +317,12 @@ class WorkerLauncher:
                     if candidate in [current / item for item in directory_names]:
                         directory_names.remove(name)
                     continue
-                entries.append((relative, cls._path_signature(candidate)))
+                entries.append(
+                    (
+                        relative,
+                        cls._path_signature(candidate, progress_check=progress_check),
+                    )
+                )
         return tuple(sorted(entries))
 
     @classmethod
@@ -446,7 +470,7 @@ class WorkerLauncher:
 
         def commit_result(
             prepared: object,
-            authority_check: Callable[[], None],
+            authority_check: Callable[[float], None],
         ) -> _GitSnapshot:
             if self.backend is None:
                 raise WorkerViolation("isolated backend is unavailable")
@@ -536,7 +560,7 @@ class WorkerLauncher:
             raise WorkerViolation("adopted stage has no durable evidence")
 
         def commit(
-            value: object, authority_check: Callable[[], None]
+            value: object, authority_check: Callable[[float], None]
         ) -> tuple[str, ...]:
             return self.backend.commit_export(task, value, authority_check)
 

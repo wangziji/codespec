@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import shutil
 import subprocess
 import sys
+import tarfile
 import threading
 import time
-from datetime import timedelta
+import tracemalloc
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 
 import pytest
-
 from codex_contract_delivery.capabilities import (
     CapabilityBroker,
     CapabilityPolicy,
@@ -30,6 +32,7 @@ from codex_contract_delivery.journal import (
 )
 from codex_contract_delivery.state_machine import RunEvent, RunState
 from codex_contract_delivery.vm_guest import (
+    _extract_source_snapshot,
     build_codex_command,
     cancel_guest_task,
     check_sandbox_prerequisites,
@@ -51,6 +54,18 @@ from codex_contract_delivery.worker import (
 
 DIGEST_A = "a" * 64
 DIGEST_B = "b" * 64
+SNAPSHOT_LIMIT = 24 * 1024 * 1024
+
+
+class MutableClock:
+    def __init__(self) -> None:
+        self.value = datetime(2026, 8, 15, tzinfo=timezone.utc)
+
+    def __call__(self) -> datetime:
+        return self.value
+
+    def advance(self, delta: timedelta) -> None:
+        self.value += delta
 
 
 def executable(path: Path) -> Path:
@@ -101,6 +116,16 @@ def initialize_linked_git(root: Path) -> None:
         ),
         check=True,
     )
+
+
+def initialize_tracked_payloads(root: Path, sizes: tuple[int, ...]) -> None:
+    root.mkdir()
+    subprocess.run(("git", "init", "-q", str(root)), check=True)
+    for index, size in enumerate(sizes):
+        path = root / f"payload-{index}.bin"
+        with path.open("wb") as stream:
+            stream.truncate(size)
+        subprocess.run(("git", "-C", str(root), "add", path.name), check=True)
 
 
 def config(tmp_path: Path) -> LimaWorkerConfig:
@@ -220,7 +245,7 @@ def commit_export_for_test(
     stdout: str,
 ) -> tuple[str, ...]:
     _, prepared = backend.prepare_export(task, stdout, "effect-test", 1)
-    return backend.commit_export(task, prepared, lambda: None)
+    return backend.commit_export(task, prepared, lambda _required: None)
 
 
 def test_lima_command_is_fixed_and_contains_no_prompt_or_host_credentials(
@@ -616,6 +641,96 @@ def test_guest_rejects_tracked_symlink_before_copying_source(
         create_source_snapshot(source)
 
     assert list(workspace_base.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("sizes", "expected_archive_size"),
+    [
+        pytest.param((SNAPSHOT_LIMIT - 2048,), SNAPSHOT_LIMIT - 512, id="below"),
+        pytest.param((SNAPSHOT_LIMIT - 1536,), SNAPSHOT_LIMIT, id="exact"),
+        pytest.param(
+            ((SNAPSHOT_LIMIT - 2048) // 2,) * 2,
+            SNAPSHOT_LIMIT,
+            id="exact-multiple-files",
+        ),
+    ],
+)
+def test_controller_snapshot_accepts_payload_at_or_below_guest_limit(
+    tmp_path: Path,
+    sizes: tuple[int, ...],
+    expected_archive_size: int,
+) -> None:
+    """Would fail if host and guest used different archive-size boundaries."""
+    source = tmp_path / "readonly-source"
+    initialize_tracked_payloads(source, sizes)
+
+    snapshot = create_source_snapshot(source)
+
+    assert len(snapshot.archive) == expected_archive_size
+    assert len(snapshot.archive) <= SNAPSHOT_LIMIT
+    if expected_archive_size == SNAPSHOT_LIMIT:
+        workspace = tmp_path / "guest-extracted"
+        workspace.mkdir()
+        _extract_source_snapshot(snapshot.archive, workspace)
+        assert sum(path.stat().st_size for path in workspace.iterdir()) == sum(sizes)
+
+
+def test_controller_snapshot_rejects_payload_just_over_guest_limit(
+    tmp_path: Path,
+) -> None:
+    """Would fail if a host-created archive could only be rejected in the guest."""
+    source = tmp_path / "readonly-source"
+    initialize_tracked_payloads(source, (SNAPSHOT_LIMIT - 1024,))
+
+    with pytest.raises(WorkerViolation, match="snapshot.*limit"):
+        create_source_snapshot(source)
+
+
+def test_controller_snapshot_rejects_single_large_file_without_large_allocation(
+    tmp_path: Path,
+) -> None:
+    """Would fail if host built a large tar before enforcing the guest limit."""
+    source = tmp_path / "readonly-source"
+    initialize_tracked_payloads(source, (25 * 1024 * 1024,))
+
+    tracemalloc.start()
+    try:
+        with pytest.raises(WorkerViolation, match="snapshot.*limit"):
+            create_source_snapshot(source)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 4 * 1024 * 1024
+
+
+def test_controller_snapshot_preserves_safe_symlink_content_and_executable_mode(
+    tmp_path: Path,
+) -> None:
+    """Would fail if bounded archive planning regressed safe links or file modes."""
+    source = tmp_path / "readonly-source"
+    source.mkdir()
+    subprocess.run(("git", "init", "-q", str(source)), check=True)
+    target = source / "target.sh"
+    target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    target.chmod(0o755)
+    (source / "alias.sh").symlink_to("target.sh")
+    subprocess.run(
+        ("git", "-C", str(source), "add", "target.sh", "alias.sh"), check=True
+    )
+
+    snapshot = create_source_snapshot(source)
+
+    with tarfile.open(fileobj=io.BytesIO(snapshot.archive), mode="r:") as archive:
+        members = {member.name: member for member in archive}
+        assert set(members) == {"alias.sh", "target.sh"}
+        assert all(
+            member.isfile() and member.mode == 0o755 for member in members.values()
+        )
+        alias = archive.extractfile(members["alias.sh"])
+        target_stream = archive.extractfile(members["target.sh"])
+        assert alias is not None and target_stream is not None
+        assert alias.read() == target_stream.read() == b"#!/bin/sh\nexit 0\n"
 
 
 def test_controller_snapshot_rejects_source_file_swapped_to_symlink(
@@ -1107,6 +1222,115 @@ def test_export_does_not_mutate_host_before_durable_commit_authorization(
     journal.close()
 
 
+def test_prepared_commit_rechecks_expired_lease_immediately_before_apply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if bounded checks could outlive their fence and still mutate."""
+    clock = MutableClock()
+    backend_config = config(tmp_path)
+    backend = LimaWorkerBackend(backend_config)
+    root = backend_config.readonly_source_root / "task"
+    initialize_linked_git(root)
+    task = WorkerTask(
+        WorkerKind.IMPLEMENTATION,
+        root,
+        "write approved file",
+        allowed_paths=("approved.txt",),
+    )
+    patch = (
+        b"diff --git a/approved.txt b/approved.txt\n"
+        b"new file mode 100644\nindex 0000000..257cc56\n"
+        b"--- /dev/null\n+++ b/approved.txt\n@@ -0,0 +1 @@\n+approved\n"
+    )
+    command = backend.canonical_command(task)
+    journal = Journal.open(tmp_path / "journal.sqlite3", clock=clock)
+    transition = journal.transition(
+        TransitionRequest(
+            "run-1",
+            0,
+            RunEvent.DISCOVER,
+            {},
+            EffectIntent("effect-1", "worker"),
+        )
+    )
+    policy = CapabilityPolicy.from_mapping(
+        {
+            "schema_version": "1.0",
+            "workflow_release_digest": DIGEST_B,
+            "policies": [
+                {
+                    "policy_id": "vm-worker",
+                    "capability": "worker.implementation",
+                    "operation": "write",
+                    "resource_pattern": str(root),
+                    "allowed_argv_prefix": list(command[:8]),
+                    "required_run_state": "discovery",
+                    "approval_digest": DIGEST_A,
+                    "actor_class": "controller",
+                    "timeout_seconds": 30,
+                    "idempotency_strategy": "effect-id",
+                    "reconciliation_strategy": "journal-probe",
+                    "allowed_environment_names": ["HOME", "PATH"],
+                    "allowed_write_roots": [str(root)],
+                }
+            ],
+        }
+    )
+    stdout = envelope(patch, b"A\x00approved.txt\x00", task.fingerprint())
+    broker = CapabilityBroker(
+        policy,
+        journal,
+        clock=clock,
+        process_runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, stdout, ""
+        ),
+    )
+    context = RunContext(
+        "run-1",
+        transition.run.revision,
+        RunState.DISCOVERY,
+        DIGEST_B,
+        DIGEST_A,
+        "controller",
+        "effect-1",
+        "controller-1",
+    )
+    grant = broker.authorize(
+        CapabilityRequest(
+            "controller",
+            "worker.implementation",
+            str(root),
+            "write",
+            command,
+            task.fingerprint(),
+        ),
+        context,
+    )
+    original_git_apply = backend._git_apply
+    mutations: list[str] = []
+
+    def expire_after_check(
+        candidate: Path, value: bytes, *arguments: str, **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        completed = original_git_apply(candidate, value, *arguments, **kwargs)
+        if "--check" in arguments:
+            clock.advance(timedelta(seconds=65))
+        else:
+            mutations.append("apply")
+        return completed
+
+    monkeypatch.setattr(backend, "_git_apply", expire_after_check)
+
+    result = WorkerLauncher(broker, backend=backend).run(task, grant)
+
+    assert result.effect.status is DispatchStatus.RECONCILIATION_REQUIRED
+    assert mutations == []
+    assert not (root / "approved.txt").exists()
+    assert journal.get_effect("run-1", "effect-1").state is EffectState.PREPARED
+    journal.close()
+
+
 def test_prepared_stage_before_apply_is_host_side_effect_free(tmp_path: Path) -> None:
     """Would fail if PREPARED durability itself mutated the approved root."""
     backend = LimaWorkerBackend(config(tmp_path))
@@ -1163,8 +1387,8 @@ def test_prepared_commit_replay_after_lost_completion_ack_is_idempotent(
         1,
     )
 
-    first = backend.commit_export(task, prepared, lambda: None)
-    second = backend.commit_export(task, prepared, lambda: None)
+    first = backend.commit_export(task, prepared, lambda _required: None)
+    second = backend.commit_export(task, prepared, lambda _required: None)
 
     assert first == second == ("approved.txt",)
     assert (root / "approved.txt").read_text(encoding="utf-8") == "approved\n"
@@ -1202,7 +1426,9 @@ def test_prepared_stage_adoption_rebinds_content_address_to_new_fence(
     assert adopted.stage_ref != prepared.stage_ref
     assert adopted.before_manifest == prepared.before_manifest
     assert adopted.after_manifest == prepared.after_manifest
-    assert backend.commit_export(task, adopted, lambda: None) == ("approved.txt",)
+    assert backend.commit_export(task, adopted, lambda _required: None) == (
+        "approved.txt",
+    )
 
 
 def test_prepared_commit_blocks_mixed_partial_host_state(tmp_path: Path) -> None:
@@ -1238,7 +1464,7 @@ def test_prepared_commit_blocks_mixed_partial_host_state(tmp_path: Path) -> None
     (root / "approved-a.txt").write_text("approved\n", encoding="utf-8")
 
     with pytest.raises(WorkerViolation, match="mixed or drifted"):
-        backend.commit_export(task, prepared, lambda: None)
+        backend.commit_export(task, prepared, lambda _required: None)
 
     assert (root / "approved-a.txt").is_file()
     assert not (root / "approved-b.txt").exists()

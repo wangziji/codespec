@@ -912,10 +912,16 @@ class Journal:
         fence: int,
         state: EffectState,
         evidence_ref: str | None,
+        *,
+        minimum_lease_ttl: timedelta = timedelta(0),
     ) -> None:
         _require_identifier("effect_id", effect_id)
         if not isinstance(fence, int) or fence <= 0:
             raise StaleFence("fence must be a positive integer")
+        if not isinstance(minimum_lease_ttl, timedelta) or minimum_lease_ttl < (
+            timedelta(0)
+        ):
+            raise ValueError("minimum_lease_ttl must be a non-negative timedelta")
         try:
             target = EffectState(state)
         except (TypeError, ValueError) as error:
@@ -947,7 +953,7 @@ class Journal:
             if (
                 row["fence"] is None
                 or row["fence"] != fence
-                or _parse_time(row["expires_at"]) <= now
+                or _parse_time(row["expires_at"]) <= now + minimum_lease_ttl
             ):
                 raise StaleFence(f"fence {fence} is not current for effect {effect_id}")
 

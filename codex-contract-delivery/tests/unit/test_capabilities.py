@@ -9,7 +9,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-
 from codex_contract_delivery.capabilities import (
     CapabilityBroker,
     CapabilityDenied,
@@ -274,7 +273,7 @@ def test_prepared_adoption_commits_only_after_new_fence_is_durable(
     def commit(prepared: object, authority_check: object) -> str:
         assert prepared == "stage-object"
         assert callable(authority_check)
-        authority_check()
+        authority_check(1.0)
         effect = journal.get_effect("run-1", "effect-1")
         assert effect is not None
         observed.append((effect.state, effect.evidence_ref))

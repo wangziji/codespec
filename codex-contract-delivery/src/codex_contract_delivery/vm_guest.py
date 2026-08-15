@@ -33,8 +33,8 @@ _TERM_GRACE_SECONDS = 1.0
 _KILL_GRACE_SECONDS = 1.0
 _PINNED_CODEX_VERSION = "0.147.0"
 _GUEST_CODEX_HOME = Path("/home/mark.guest/.codex")
-_MAX_REQUEST_BYTES = 32 * 1024 * 1024
-_MAX_SNAPSHOT_BYTES = 24 * 1024 * 1024
+MAX_SOURCE_SNAPSHOT_BYTES = 24 * 1024 * 1024
+MAX_WORKER_REQUEST_BYTES = ((MAX_SOURCE_SNAPSHOT_BYTES + 2) // 3) * 4 + 1024 * 1024
 _REQUEST_FIELDS = frozenset(
     {
         "schema_version",
@@ -604,8 +604,8 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser.parse_args(values)
     if _DIGEST.fullmatch(arguments.authority_digest) is None:
         parser.error("worker authority digest is invalid")
-    request_text = sys.stdin.read(_MAX_REQUEST_BYTES + 1)
-    if len(request_text) > _MAX_REQUEST_BYTES:
+    request_text = sys.stdin.read(MAX_WORKER_REQUEST_BYTES + 1)
+    if len(request_text) > MAX_WORKER_REQUEST_BYTES:
         parser.error("worker request exceeds the bounded snapshot envelope")
     try:
         check_sandbox_prerequisites()
@@ -757,7 +757,7 @@ def parse_request(value: str, *, expected_fingerprint: str) -> GuestRequest:
     except (binascii.Error, ValueError) as error:
         raise ValueError("source snapshot payload is invalid") from error
     if (
-        len(snapshot) > _MAX_SNAPSHOT_BYTES
+        len(snapshot) > MAX_SOURCE_SNAPSHOT_BYTES
         or sha256(snapshot).hexdigest() != snapshot_digest
     ):
         raise ValueError("source snapshot payload drifted")

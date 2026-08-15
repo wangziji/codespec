@@ -15,6 +15,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -22,7 +23,21 @@ from hashlib import sha256
 from pathlib import Path
 
 from .canonical import canonical_digest
+from .vm_guest import MAX_SOURCE_SNAPSHOT_BYTES, MAX_WORKER_REQUEST_BYTES
 from .worker import WorkerKind, WorkerLauncher, WorkerTask, WorkerViolation
+
+_COMMIT_PREPARATION_SECONDS = 10.0
+_GIT_APPLY_SECONDS = 5.0
+_GIT_TERMINATION_SECONDS = 2.0
+_POST_APPLY_VERIFICATION_SECONDS = 5.0
+_ROLLBACK_SECONDS = 5.0
+_COMMIT_MUTATION_AUTHORITY_SECONDS = (
+    _GIT_APPLY_SECONDS
+    + _GIT_TERMINATION_SECONDS
+    + _POST_APPLY_VERIFICATION_SECONDS
+    + _ROLLBACK_SECONDS
+    + _GIT_TERMINATION_SECONDS
+)
 
 
 @dataclass(frozen=True)
@@ -99,6 +114,38 @@ class SourceSnapshot:
     archive: bytes
 
 
+@dataclass(frozen=True)
+class _SnapshotEntry:
+    relative: str
+    candidate: Path
+    source_candidate: Path
+    archive_mode: int
+    details: os.stat_result
+    link_details: os.stat_result | None
+    link_target: str | None
+
+
+def _snapshot_tar_info(entry: _SnapshotEntry) -> tarfile.TarInfo:
+    info = tarfile.TarInfo(entry.candidate.as_posix())
+    info.size = entry.details.st_size
+    info.mode = entry.archive_mode
+    info.mtime = 0
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    return info
+
+
+def _stat_identity(details: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_size,
+        details.st_mtime_ns,
+    )
+
+
 def _open_directory_beneath(root: Path, parts: tuple[str, ...]) -> int:
     descriptor = os.open(
         root,
@@ -150,104 +197,177 @@ def _read_link_beneath(root: Path, candidate: Path) -> tuple[os.stat_result, str
 
 def create_source_snapshot(source: Path) -> SourceSnapshot:
     """Build a deterministic, tracked-only snapshot without exposing git metadata."""
-    completed = subprocess.run(
-        ("git", "-C", str(source), "ls-files", "--cached", "--stage", "-z"),
-        shell=False,
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise WorkerViolation("approved source cannot produce a tracked snapshot")
     entries: list[tuple[str, Path, str]] = []
     modes: dict[str, str] = {}
-    for raw_entry in completed.stdout.split(b"\x00"):
-        if not raw_entry:
-            continue
+    process = subprocess.Popen(
+        ("git", "-C", str(source), "ls-files", "--cached", "--stage", "-z"),
+        shell=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    assert process.stdout is not None
+    pending = bytearray()
+    try:
+        while chunk := process.stdout.read(64 * 1024):
+            pending.extend(chunk)
+            while (separator := pending.find(0)) >= 0:
+                raw_entry = bytes(pending[:separator])
+                del pending[: separator + 1]
+                if not raw_entry:
+                    continue
+                try:
+                    metadata, raw_path = raw_entry.split(b"\t", 1)
+                    mode, _object_id, stage = metadata.decode("ascii").split(" ")
+                    relative = raw_path.decode("utf-8")
+                except (UnicodeDecodeError, ValueError) as error:
+                    raise WorkerViolation(
+                        "tracked source manifest is malformed"
+                    ) from error
+                candidate = Path(relative)
+                if (
+                    mode not in {"100644", "100755", "120000"}
+                    or stage != "0"
+                    or candidate.is_absolute()
+                    or ".." in candidate.parts
+                    or not relative
+                    or candidate.parts[0] == ".codex"
+                    or candidate.name == ".mcp.json"
+                    or relative in modes
+                ):
+                    raise WorkerViolation(
+                        "tracked source contains an unsupported entry"
+                    )
+                if (len(entries) + 1) * tarfile.BLOCKSIZE + 1024 > (
+                    MAX_SOURCE_SNAPSHOT_BYTES
+                ):
+                    raise WorkerViolation(
+                        "tracked source snapshot exceeds payload limit"
+                    )
+                entries.append((relative, candidate, mode))
+                modes[relative] = mode
+            if len(pending) > 16 * 1024:
+                raise WorkerViolation("tracked source manifest is malformed")
+        if pending:
+            raise WorkerViolation("tracked source manifest is malformed")
+        if process.wait() != 0:
+            raise WorkerViolation("approved source cannot produce a tracked snapshot")
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    finally:
+        process.stdout.close()
+
+    planned: list[_SnapshotEntry] = []
+    payload_size = 1024
+    for relative, candidate, mode in entries:
+        link_details: os.stat_result | None = None
+        link_target: str | None = None
+        if mode == "120000":
+            link_details, link_target = _read_link_beneath(source, candidate)
+            target = Path(link_target)
+            if target.is_absolute() or ".." in target.parts:
+                raise WorkerViolation(
+                    "tracked source contains a symlink or path escape"
+                )
+            target_relative = (candidate.parent / target).as_posix()
+            target_mode = modes.get(target_relative)
+            if target_mode not in {"100644", "100755"}:
+                raise WorkerViolation(
+                    "tracked symlink target is not a tracked regular file"
+                )
+            mode = target_mode
+            source_candidate = Path(target_relative)
+        else:
+            source_candidate = candidate
+        descriptor = _open_regular_beneath(source, source_candidate)
         try:
-            metadata, raw_path = raw_entry.split(b"\t", 1)
-            mode, _object_id, stage = metadata.decode("ascii").split(" ")
-            relative = raw_path.decode("utf-8")
-        except (UnicodeDecodeError, ValueError) as error:
-            raise WorkerViolation("tracked source manifest is malformed") from error
-        candidate = Path(relative)
-        if (
-            mode not in {"100644", "100755", "120000"}
-            or stage != "0"
-            or candidate.is_absolute()
-            or ".." in candidate.parts
-            or not relative
-            or candidate.parts[0] == ".codex"
-            or candidate.name == ".mcp.json"
-            or relative in modes
-        ):
+            details = os.fstat(descriptor)
+            if not stat.S_ISREG(details.st_mode):
+                raise WorkerViolation(
+                    "tracked source contains a symlink or path escape"
+                )
+        finally:
+            os.close(descriptor)
+        planned_entry = _SnapshotEntry(
+            relative,
+            candidate,
+            source_candidate,
+            0o755 if mode == "100755" else 0o644,
+            details,
+            link_details,
+            link_target,
+        )
+        try:
+            header_size = len(
+                _snapshot_tar_info(planned_entry).tobuf(format=tarfile.PAX_FORMAT)
+            )
+        except (UnicodeError, ValueError) as error:
+            raise WorkerViolation(
+                "tracked source contains an unsupported entry"
+            ) from error
+        if header_size != tarfile.BLOCKSIZE:
             raise WorkerViolation("tracked source contains an unsupported entry")
-        entries.append((relative, candidate, mode))
-        modes[relative] = mode
+        payload_size += header_size + (
+            (details.st_size + tarfile.BLOCKSIZE - 1)
+            // tarfile.BLOCKSIZE
+            * tarfile.BLOCKSIZE
+        )
+        if payload_size > MAX_SOURCE_SNAPSHOT_BYTES:
+            raise WorkerViolation("tracked source snapshot exceeds payload limit")
+        planned.append(planned_entry)
+
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w", format=tarfile.PAX_FORMAT) as archive:
-        for relative, candidate, mode in entries:
-            link_before: os.stat_result | None = None
-            link_target: str | None = None
-            if mode == "120000":
-                link_before, link_target = _read_link_beneath(source, candidate)
-                target = Path(link_target)
-                if target.is_absolute() or ".." in target.parts:
-                    raise WorkerViolation(
-                        "tracked source contains a symlink or path escape"
-                    )
-                target_relative = (candidate.parent / target).as_posix()
-                target_mode = modes.get(target_relative)
-                if target_mode not in {"100644", "100755"}:
-                    raise WorkerViolation(
-                        "tracked symlink target is not a tracked regular file"
-                    )
-                mode = target_mode
-                source_candidate = Path(target_relative)
-            else:
-                source_candidate = candidate
-            descriptor = _open_regular_beneath(source, source_candidate)
+        for entry in planned:
+            descriptor = _open_regular_beneath(source, entry.source_candidate)
             try:
                 before = os.fstat(descriptor)
-                if not stat.S_ISREG(before.st_mode):
-                    raise WorkerViolation(
-                        "tracked source contains a symlink or path escape"
-                    )
-                info = tarfile.TarInfo(candidate.as_posix())
-                info.size = before.st_size
-                info.mode = 0o755 if mode == "100755" else 0o644
-                info.mtime = 0
-                info.uid = 0
-                info.gid = 0
-                info.uname = ""
-                info.gname = ""
-                with os.fdopen(os.dup(descriptor), "rb") as stream:
-                    archive.addfile(info, stream)
-                after = os.fstat(descriptor)
-                if (
-                    before.st_dev,
-                    before.st_ino,
-                    before.st_size,
-                    before.st_mtime_ns,
-                ) != (
-                    after.st_dev,
-                    after.st_ino,
-                    after.st_size,
-                    after.st_mtime_ns,
+                if not stat.S_ISREG(before.st_mode) or _stat_identity(before) != (
+                    _stat_identity(entry.details)
                 ):
                     raise WorkerViolation("tracked source changed during snapshot")
-                if link_before is not None:
-                    current_link, current_target = _read_link_beneath(source, candidate)
-                    if current_link != link_before or current_target != link_target:
+                if entry.link_details is not None:
+                    current_link, current_target = _read_link_beneath(
+                        source, entry.candidate
+                    )
+                    if (
+                        current_link != entry.link_details
+                        or current_target != entry.link_target
+                    ):
+                        raise WorkerViolation("tracked symlink changed during snapshot")
+                with os.fdopen(os.dup(descriptor), "rb") as stream:
+                    archive.addfile(_snapshot_tar_info(entry), stream)
+                after = os.fstat(descriptor)
+                if _stat_identity(before) != _stat_identity(after):
+                    raise WorkerViolation("tracked source changed during snapshot")
+                if entry.link_details is not None:
+                    current_link, current_target = _read_link_beneath(
+                        source, entry.candidate
+                    )
+                    if (
+                        current_link != entry.link_details
+                        or current_target != entry.link_target
+                    ):
                         raise WorkerViolation("tracked symlink changed during snapshot")
             finally:
                 os.close(descriptor)
+        if archive.offset + 1024 != payload_size:
+            raise WorkerViolation("tracked source snapshot size drifted")
+    output.truncate(payload_size)
     value = output.getvalue()
     return SourceSnapshot(sha256(value).hexdigest(), value)
 
 
 class LimaWorkerBackend:
-    def __init__(self, config: LimaWorkerConfig) -> None:
+    def __init__(
+        self,
+        config: LimaWorkerConfig,
+        *,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.config = config
+        self._monotonic_clock = monotonic_clock
         self._source_snapshots: dict[str, SourceSnapshot] = {}
         self._task_authorities: dict[str, str] = {}
         original_identity = self._identity(config.limactl_executable)
@@ -433,7 +553,9 @@ class LimaWorkerBackend:
         return canonical_digest(authority)
 
     @contextmanager
-    def _root_lock(self, root: Path) -> Iterator[None]:
+    def _root_lock(
+        self, root: Path, *, deadline: float | None = None
+    ) -> Iterator[None]:
         locks = self.config.host_staging_root / "locks"
         locks.mkdir(mode=0o700, exist_ok=True)
         locks.chmod(0o700)
@@ -444,11 +566,34 @@ class LimaWorkerBackend:
             0o600,
         )
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            if deadline is None:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            else:
+                while True:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError as error:
+                        remaining = deadline - self._monotonic_clock()
+                        if remaining <= 0:
+                            raise WorkerViolation(
+                                "prepared export exceeded commit preparation budget"
+                            ) from error
+                        time.sleep(min(0.01, remaining))
             yield
         finally:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
+
+    def _commit_progress_check(self, deadline: float) -> None:
+        if self._monotonic_clock() >= deadline:
+            raise WorkerViolation("prepared export exceeded commit preparation budget")
+
+    def _remaining_commit_seconds(self, deadline: float) -> float:
+        remaining = deadline - self._monotonic_clock()
+        if remaining <= 0:
+            raise WorkerViolation("prepared export exceeded commit preparation budget")
+        return remaining
 
     def canonical_command(self, task: WorkerTask) -> tuple[str, ...]:
         source = task.approved_root.resolve(strict=True)
@@ -483,13 +628,12 @@ class LimaWorkerBackend:
         )
 
     def request_payload(self, task: WorkerTask) -> dict[str, str]:
-        expected = self._source_snapshots.get(task.fingerprint())
-        current = create_source_snapshot(task.approved_root.resolve(strict=True))
-        if expected is None or current.digest != expected.digest:
-            raise WorkerViolation("tracked source snapshot drifted after authorization")
+        snapshot = self._source_snapshots.get(task.fingerprint())
+        if snapshot is None:
+            raise WorkerViolation("tracked source snapshot is not authorized")
         return {
-            "source_snapshot_sha256": current.digest,
-            "source_snapshot_b64": base64.b64encode(current.archive).decode("ascii"),
+            "source_snapshot_sha256": snapshot.digest,
+            "source_snapshot_b64": base64.b64encode(snapshot.archive).decode("ascii"),
         }
 
     def cancel(
@@ -609,21 +753,52 @@ class LimaWorkerBackend:
 
     @staticmethod
     def _git_apply(
-        root: Path, patch: bytes, *arguments: str
+        root: Path,
+        patch: bytes,
+        *arguments: str,
+        timeout: float | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
-        return subprocess.run(
+        process = subprocess.Popen(
             ("git", "-C", str(root), "apply", *arguments, "-"),
-            input=patch,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             shell=False,
-            capture_output=True,
-            check=False,
+        )
+        try:
+            stdout, stderr = process.communicate(input=patch, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                stdout, stderr = process.communicate(timeout=_GIT_TERMINATION_SECONDS)
+            except subprocess.TimeoutExpired as termination_error:
+                raise WorkerViolation(
+                    "git apply did not terminate within commit budget"
+                ) from termination_error
+            return subprocess.CompletedProcess(
+                process.args,
+                process.returncode if process.returncode is not None else -9,
+                stdout,
+                stderr,
+            )
+        return subprocess.CompletedProcess(
+            process.args,
+            process.returncode,
+            stdout,
+            stderr,
         )
 
     @staticmethod
-    def _file_manifest(root: Path) -> dict[str, str]:
+    def _file_manifest(
+        root: Path, *, progress_check: Callable[[], None] | None = None
+    ) -> dict[str, str]:
         return {
             path: signature
-            for path, signature in WorkerLauncher._manifest(root, skip_root_git=True)
+            for path, signature in WorkerLauncher._manifest(
+                root,
+                skip_root_git=True,
+                progress_check=progress_check,
+            )
             if not signature.startswith("dir:")
         }
 
@@ -735,7 +910,28 @@ class LimaWorkerBackend:
                 shutil.rmtree(temporary)
         return target
 
-    def _load_stage(self, prepared: PreparedExport) -> tuple[bytes, dict[str, object]]:
+    @staticmethod
+    def _read_bounded_stage_file(
+        path: Path, progress_check: Callable[[], None] | None
+    ) -> bytes:
+        if path.stat().st_size > MAX_WORKER_REQUEST_BYTES:
+            raise WorkerViolation("prepared export stage exceeds bounded size")
+        value = bytearray()
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                if progress_check is not None:
+                    progress_check()
+                value.extend(chunk)
+        return bytes(value)
+
+    def _load_stage(
+        self,
+        prepared: PreparedExport,
+        *,
+        progress_check: Callable[[], None] | None = None,
+    ) -> tuple[bytes, dict[str, object]]:
+        if progress_check is not None:
+            progress_check()
         directory = self.config.host_staging_root / prepared.stage_digest
         if directory.is_symlink() or directory.resolve(strict=True) != directory:
             raise WorkerViolation("prepared export stage path drifted")
@@ -757,10 +953,14 @@ class LimaWorkerBackend:
                 or details.st_mode & 0o377
             ):
                 raise WorkerViolation("prepared export stage identity drifted")
-        patch = patch_path.read_bytes()
+        patch = self._read_bounded_stage_file(patch_path, progress_check)
         try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
+            metadata = json.loads(
+                self._read_bounded_stage_file(metadata_path, progress_check).decode(
+                    "utf-8"
+                )
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise WorkerViolation("prepared export metadata is malformed") from error
         if not isinstance(metadata, dict) or canonical_digest(metadata) != (
             prepared.stage_digest
@@ -855,7 +1055,7 @@ class LimaWorkerBackend:
         self,
         task: WorkerTask,
         prepared: object,
-        authority_check: Callable[[], None],
+        authority_check: Callable[[float], None],
     ) -> tuple[str, ...]:
         if not isinstance(prepared, PreparedExport):
             raise WorkerViolation("prepared export has an unknown type")
@@ -864,25 +1064,60 @@ class LimaWorkerBackend:
         root = task.approved_root.resolve(strict=True)
         before = dict(prepared.before_manifest)
         expected_after = dict(prepared.after_manifest)
-        with self._root_lock(root):
-            authority_check()
-            patch, metadata = self._load_stage(prepared)
+        preparation_deadline = self._monotonic_clock() + _COMMIT_PREPARATION_SECONDS
+        with self._root_lock(root, deadline=preparation_deadline):
+            authority_check(
+                _COMMIT_PREPARATION_SECONDS + _COMMIT_MUTATION_AUTHORITY_SECONDS
+            )
+            progress_check = lambda: self._commit_progress_check(preparation_deadline)
+            patch, metadata = self._load_stage(prepared, progress_check=progress_check)
             if (
                 metadata.get("effect_id") != prepared.effect_id
                 or metadata.get("fence") != prepared.fence
                 or metadata.get("approved_root") != str(root)
             ):
                 raise WorkerViolation("prepared export authority metadata drifted")
-            current = self._file_manifest(root)
+            current = self._file_manifest(root, progress_check=progress_check)
             if current == expected_after:
                 return prepared.declared_paths
             if current != before:
                 raise WorkerViolation("prepared export host state is mixed or drifted")
-            checked = self._git_apply(root, patch, "--check", "--binary")
+            checked = self._git_apply(
+                root,
+                patch,
+                "--check",
+                "--binary",
+                timeout=min(
+                    _GIT_APPLY_SECONDS,
+                    self._remaining_commit_seconds(preparation_deadline),
+                ),
+            )
             if checked.returncode != 0:
                 raise WorkerViolation("prepared export no longer applies to host state")
-            applied = self._git_apply(root, patch, "--binary")
-            observed = self._file_manifest(root)
+            self._commit_progress_check(preparation_deadline)
+            mutation_deadline = (
+                self._monotonic_clock() + _COMMIT_MUTATION_AUTHORITY_SECONDS
+            )
+            authority_check(_COMMIT_MUTATION_AUTHORITY_SECONDS)
+            applied = self._git_apply(
+                root,
+                patch,
+                "--binary",
+                timeout=_GIT_APPLY_SECONDS,
+            )
+            verification_deadline = min(
+                mutation_deadline,
+                self._monotonic_clock() + _POST_APPLY_VERIFICATION_SECONDS,
+            )
+            try:
+                observed = self._file_manifest(
+                    root,
+                    progress_check=lambda: self._commit_progress_check(
+                        verification_deadline
+                    ),
+                )
+            except WorkerViolation:
+                observed = None
             if applied.returncode == 0 and observed == expected_after:
                 return prepared.declared_paths
             if observed == before:
@@ -890,8 +1125,20 @@ class LimaWorkerBackend:
                     "prepared export application failed before mutation"
                 )
             if patch:
-                self._git_apply(root, patch, "--reverse", "--binary")
-            rolled_back = self._file_manifest(root)
+                self._git_apply(
+                    root,
+                    patch,
+                    "--reverse",
+                    "--binary",
+                    timeout=min(
+                        _ROLLBACK_SECONDS,
+                        self._remaining_commit_seconds(mutation_deadline),
+                    ),
+                )
+            rolled_back = self._file_manifest(
+                root,
+                progress_check=lambda: self._commit_progress_check(mutation_deadline),
+            )
             if rolled_back == before:
                 raise WorkerViolation(
                     "prepared export partially applied and was rolled back"
