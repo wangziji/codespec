@@ -4,11 +4,11 @@ import json
 import os
 import subprocess
 import tempfile
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import time
 from pathlib import Path
 
 import pytest
+
 from codex_contract_delivery.capabilities import (
     CapabilityBroker,
     CapabilityPolicy,
@@ -16,45 +16,48 @@ from codex_contract_delivery.capabilities import (
     DispatchStatus,
     RunContext,
 )
-from codex_contract_delivery.journal import EffectIntent, Journal, TransitionRequest
+from codex_contract_delivery.journal import (
+    EffectIntent,
+    EffectState,
+    Journal,
+    TransitionRequest,
+)
 from codex_contract_delivery.state_machine import RunEvent, RunState
-from codex_contract_delivery.worker import WorkerKind, WorkerLauncher, WorkerTask
+from codex_contract_delivery.vm_worker import LimaWorkerBackend, LimaWorkerConfig
+from codex_contract_delivery.worker import (
+    WorkerKind,
+    WorkerLauncher,
+    WorkerTask,
+    WorkerViolation,
+)
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("CDD_RUN_REAL_CODEX_SANDBOX") != "1",
-    reason="set CDD_RUN_REAL_CODEX_SANDBOX=1 for the real local Codex sandbox smoke",
+    reason="set CDD_RUN_REAL_CODEX_SANDBOX=1 for the real Lima Codex smoke",
 )
 
 DIGEST_A = "a" * 64
 DIGEST_B = "b" * 64
-CODEX = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
+CHECKOUT = Path(__file__).parents[3]
+PACKAGE = Path(__file__).parents[2]
+LIMACTL = Path("/opt/homebrew/bin/limactl")
+GUEST_WORKSPACES = Path("/home/mark.guest/.local/share/cdd/workspaces")
+GUEST_RUNNER = PACKAGE / "src" / "codex_contract_delivery" / "vm_guest.py"
+GUEST_CODEX_HOME = Path("/home/mark.guest/.codex")
 
 
 def initialize_git(root: Path) -> None:
-    root.rmdir()
-    source = root.parent / "source"
+    source = root.parent / f"{root.name}-source"
     source.mkdir()
     subprocess.run(("git", "init", "-q", str(source)), check=True)
     subprocess.run(
-        (
-            "git",
-            "-C",
-            str(source),
-            "config",
-            "user.email",
-            "sandbox@example.invalid",
-        ),
+        ("git", "-C", str(source), "config", "user.email", "vm@example.invalid"),
         check=True,
     )
-    subprocess.run(
-        ("git", "-C", str(source), "config", "user.name", "Sandbox Smoke"),
-        check=True,
-    )
-    (source / "README.md").write_text("sandbox smoke\n", encoding="utf-8")
+    subprocess.run(("git", "-C", str(source), "config", "user.name", "VM"), check=True)
+    (source / "README.md").write_text("vm sandbox smoke\n", encoding="utf-8")
     subprocess.run(("git", "-C", str(source), "add", "README.md"), check=True)
-    subprocess.run(
-        ("git", "-C", str(source), "commit", "-qm", "sandbox base"), check=True
-    )
+    subprocess.run(("git", "-C", str(source), "commit", "-qm", "base"), check=True)
     subprocess.run(
         (
             "git",
@@ -71,7 +74,48 @@ def initialize_git(root: Path) -> None:
     )
 
 
-def run_worker(tmp_path: Path, root: Path, effect_id: str, prompt: str):
+def command_events(jsonl: str) -> tuple[dict[str, object], ...]:
+    events: list[dict[str, object]] = []
+    for line in jsonl.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = event.get("item") if isinstance(event, dict) else None
+        if isinstance(item, dict) and item.get("type") == "command_execution":
+            events.append(item)
+    return tuple(events)
+
+
+def configured_worker(
+    tmp_path: Path,
+    sandbox_base: Path,
+    effect_id: str,
+    prompt: str,
+    *,
+    allowed_paths: tuple[str, ...],
+    timeout_seconds: int = 120,
+    kind: WorkerKind = WorkerKind.IMPLEMENTATION,
+) -> tuple[WorkerLauncher, WorkerTask, object, CapabilityBroker, Journal]:
+    root = sandbox_base / f"{effect_id}-worktree"
+    initialize_git(root)
+    backend = LimaWorkerBackend(
+        LimaWorkerConfig(
+            limactl_executable=LIMACTL,
+            instance="codex-worker",
+            readonly_source_root=CHECKOUT,
+            guest_workspace_root=GUEST_WORKSPACES,
+            guest_python=Path("/usr/bin/python3"),
+            guest_runner=GUEST_RUNNER,
+        )
+    )
+    task = WorkerTask(
+        kind,
+        root,
+        prompt,
+        allowed_paths=allowed_paths,
+    )
+    command = backend.canonical_command(task)
     journal = Journal.open(tmp_path / f"{effect_id}.sqlite3")
     transition = journal.transition(
         TransitionRequest(
@@ -85,27 +129,21 @@ def run_worker(tmp_path: Path, root: Path, effect_id: str, prompt: str):
     policy = CapabilityPolicy.from_mapping(
         {
             "schema_version": "1.0",
+            "workflow_release_digest": DIGEST_B,
             "policies": [
                 {
                     "policy_id": effect_id,
-                    "capability": "worker.implementation",
-                    "operation": "write",
+                    "capability": f"worker.{kind.value}",
+                    "operation": "read" if kind is WorkerKind.ANALYSIS else "write",
                     "resource_pattern": str(root),
-                    "allowed_argv_prefix": [str(CODEX), "exec"],
+                    "allowed_argv_prefix": list(command[:8]),
                     "required_run_state": "discovery",
                     "approval_digest": DIGEST_A,
                     "actor_class": "controller",
-                    "timeout_seconds": 120,
+                    "timeout_seconds": timeout_seconds,
                     "idempotency_strategy": "effect-id",
                     "reconciliation_strategy": "journal-probe",
-                    "allowed_environment_names": [
-                        "HOME",
-                        "PATH",
-                        "LANG",
-                        "LC_ALL",
-                        "TMPDIR",
-                        "CODEX_HOME",
-                    ],
+                    "allowed_environment_names": ["HOME", "PATH", "TMPDIR"],
                     "allowed_write_roots": [str(root)],
                 }
             ],
@@ -113,132 +151,423 @@ def run_worker(tmp_path: Path, root: Path, effect_id: str, prompt: str):
     )
     broker = CapabilityBroker(policy, journal)
     context = RunContext(
-        run_id=effect_id,
-        revision=transition.run.revision,
-        state=RunState.DISCOVERY,
-        workflow_release_digest=DIGEST_B,
-        approval_digest=DIGEST_A,
-        actor_class="controller",
-        effect_id=effect_id,
-        worker_id="sandbox-controller",
+        effect_id,
+        transition.run.revision,
+        RunState.DISCOVERY,
+        DIGEST_B,
+        DIGEST_A,
+        "controller",
+        effect_id,
+        "vm-controller",
     )
     grant = broker.authorize(
-        CapabilityRequest("controller", "worker.implementation", str(root), "write"),
+        CapabilityRequest(
+            "controller",
+            f"worker.{kind.value}",
+            str(root),
+            "read" if kind is WorkerKind.ANALYSIS else "write",
+            command,
+            task.fingerprint(),
+        ),
         context,
     )
-    launcher = WorkerLauncher(broker, codex_executable=str(CODEX))
-    try:
-        result = launcher.run(
-            WorkerTask(WorkerKind.IMPLEMENTATION, root, prompt), grant
-        )
-        return result, broker.decisions
-    finally:
-        journal.close()
-
-
-def command_events(jsonl: str) -> tuple[dict[str, object], ...]:
-    events: list[dict[str, object]] = []
-    for line in jsonl.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        item = event.get("item")
-        if isinstance(item, dict) and item.get("type") == "command_execution":
-            events.append(item)
-    return tuple(events)
+    return WorkerLauncher(broker, backend=backend), task, grant, broker, journal
 
 
 @pytest.fixture
 def sandbox_base() -> Path:
-    """Place denial probes outside macOS sandbox's globally writable temp roots."""
-    checkout = Path(__file__).parents[3]
-    with tempfile.TemporaryDirectory(prefix=".cdd-sandbox-", dir=checkout) as directory:
+    with tempfile.TemporaryDirectory(prefix=".cdd-vm-", dir=CHECKOUT) as directory:
         yield Path(directory)
 
 
-def test_real_codex_workspace_sandbox_allows_inside_and_denies_escape_and_network(
+def test_real_lima_worker_isolates_host_and_enforces_export_scope(
     tmp_path: Path, sandbox_base: Path
 ) -> None:
-    """Would fail if real Codex could bypass write-root or direct-network isolation."""
-    assert CODEX.is_file(), "real Codex CLI binary is unavailable"
-    root = sandbox_base / "worktree"
-    root.mkdir()
-    initialize_git(root)
+    """Proves the approved Lima worker boundary with a real authenticated Codex."""
+    assert LIMACTL.is_file()
+    sysctl = subprocess.run(
+        (
+            str(LIMACTL),
+            "shell",
+            "codex-worker",
+            "--",
+            "/bin/cat",
+            "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+        ),
+        shell=False,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert sysctl.returncode == 0 and sysctl.stdout.strip() == "1", sysctl.stderr
+    apparmor = subprocess.run(
+        (
+            str(LIMACTL),
+            "shell",
+            "codex-worker",
+            "--",
+            "/bin/cat",
+            "/sys/module/apparmor/parameters/enabled",
+        ),
+        shell=False,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert apparmor.returncode == 0 and apparmor.stdout.strip() == "Y"
+    bwrap = subprocess.run(
+        (
+            str(LIMACTL),
+            "shell",
+            "codex-worker",
+            "--",
+            "/usr/bin/bwrap",
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-net",
+            "--ro-bind",
+            "/",
+            "/",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "/usr/bin/true",
+        ),
+        shell=False,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert bwrap.returncode == 0, bwrap.stderr
+    for sensitive_home_path in (
+        "/Users/mark/.ssh",
+        "/Users/mark/.codex",
+        "/Users/mark/.config",
+        "/Users/mark/Library/Keychains",
+    ):
+        absent = subprocess.run(
+            (
+                str(LIMACTL),
+                "shell",
+                "codex-worker",
+                "--",
+                "/usr/bin/test",
+                "!",
+                "-e",
+                sensitive_home_path,
+            ),
+            shell=False,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert absent.returncode == 0, (
+            f"host HOME path is visible: {sensitive_home_path}"
+        )
 
-    allowed, _ = run_worker(
+    launcher, task, grant, _, journal = configured_worker(
         tmp_path,
-        root,
+        sandbox_base,
         "allowed-write",
         "Run exactly this shell command, then stop: printf 'allowed\\n' > allowed.txt",
+        allowed_paths=("allowed.txt",),
     )
+    allowed = launcher.run(task, grant)
     assert allowed.effect.status is DispatchStatus.COMPLETED, allowed.effect.stdout
-    assert (root / "allowed.txt").read_text(encoding="utf-8") == "allowed\n"
-    assert "allowed.txt" in allowed.changed_paths
-    assert any(
-        "allowed.txt" in str(event.get("command", ""))
-        for event in command_events(allowed.effect.stdout)
-    ), allowed.effect.stdout
+    assert (task.approved_root / "allowed.txt").read_text(
+        encoding="utf-8"
+    ) == "allowed\n"
+    assert allowed.changed_paths == ("allowed.txt",)
+    journal.close()
 
-    outside = sandbox_base / "outside.txt"
-    escaped, escape_decisions = run_worker(
+    launcher, task, grant, _, journal = configured_worker(
         tmp_path,
-        root,
-        "outside-write",
-        f"Run exactly this shell command, then stop: printf 'escaped\\n' > {outside}",
+        sandbox_base,
+        "readonly-mount",
+        "Run exactly this shell command, then stop: "
+        "/bin/sh ./readonly-mount-probe.sh && printf MOUNT_REACHED "
+        "|| printf MOUNT_BLOCKED",
+        allowed_paths=("approved.txt",),
     )
-    assert escaped.effect.status is DispatchStatus.COMPLETED, escaped.effect.stdout
-    escape_events = command_events(escaped.effect.stdout)
-    matching_escape_events = tuple(
-        event
-        for event in escape_events
-        if str(outside) in str(event.get("command", ""))
-        and event.get("status") != "in_progress"
+    (task.approved_root / "readonly-mount-probe.sh").write_text(
+        f"#!/bin/sh\nprintf forbidden > {sandbox_base}/readonly-mount-probe\n",
+        encoding="utf-8",
     )
-    assert all(
-        event.get("exit_code") not in (0, None) for event in matching_escape_events
-    ), escaped.effect.stdout
-    assert outside.exists() is False
-    assert escape_decisions[-1].allowed is True
-
-    received_posts: list[bytes] = []
-
-    class Recorder(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length", "0"))
-            received_posts.append(self.rfile.read(length))
-            self.send_response(204)
-            self.end_headers()
-
-        def log_message(self, format: str, *args: object) -> None:
-            del format, args
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Recorder)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        port = server.server_address[1]
-        networked, _ = run_worker(
-            tmp_path,
-            root,
-            "network-post",
-            "Run exactly this shell command, then stop: "
-            f"/usr/bin/curl -fsS -X POST --data sandbox-probe http://127.0.0.1:{port}/mutation",
-        )
-    finally:
-        server.shutdown()
-        thread.join(timeout=5)
-        server.server_close()
-
-    assert networked.effect.status is DispatchStatus.COMPLETED, networked.effect.stdout
-    network_events = command_events(networked.effect.stdout)
+    subprocess.run(
+        ("git", "-C", str(task.approved_root), "add", "readonly-mount-probe.sh"),
+        check=True,
+    )
+    subprocess.run(
+        ("git", "-C", str(task.approved_root), "commit", "-qm", "mount probe"),
+        check=True,
+    )
+    readonly = launcher.run(task, grant)
+    assert not (sandbox_base / "readonly-mount-probe").exists()
+    readonly_events = command_events(readonly.effect.stdout)
+    assert readonly_events, readonly.effect.stdout
     assert any(
-        "sandbox-probe" in str(event.get("command", "")) for event in network_events
-    ), networked.effect.stdout
-    assert all(
-        event.get("exit_code") not in (0, None)
-        for event in network_events
-        if "sandbox-probe" in str(event.get("command", ""))
-        and event.get("status") != "in_progress"
-    ), networked.effect.stdout
-    assert received_posts == []
+        "MOUNT_BLOCKED" in str(event.get("aggregated_output", ""))
+        for event in readonly_events
+    ), readonly.effect.stdout
+    journal.close()
+
+    launcher, task, grant, broker, journal = configured_worker(
+        tmp_path,
+        sandbox_base,
+        "path-denial",
+        "Run exactly this shell command, then stop: printf 'outside\\n' > outside.txt",
+        allowed_paths=("approved.txt",),
+    )
+    with pytest.raises(WorkerViolation, match="approved paths"):
+        launcher.run(task, grant)
+    assert not (task.approved_root / "outside.txt").exists()
+    assert broker.decisions[-1].allowed is False
+    assert broker.decisions[-1].reason_code == "result-policy-violation"
+    effect = journal.get_effect("path-denial", "path-denial")
+    assert effect is not None and effect.state is EffectState.COMPLETED
+    assert effect.evidence_ref is not None
+    assert effect.evidence_ref.startswith("effect-result://sha256/")
+    journal.close()
+
+
+def test_real_lima_fixed_profile_denies_codex_home_but_keeps_auth_and_write(
+    tmp_path: Path, sandbox_base: Path
+) -> None:
+    """Proves fixed overrides deny credential-like reads while preserving auth."""
+    sentinel = GUEST_CODEX_HOME / "cdd-auth-sentinel"
+    create = subprocess.run(
+        (
+            str(LIMACTL),
+            "shell",
+            "codex-worker",
+            "--",
+            "/usr/bin/touch",
+            str(sentinel),
+        ),
+        shell=False,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert create.returncode == 0, create.stderr
+    journal: Journal | None = None
+    try:
+        launcher, task, grant, _, journal = configured_worker(
+            tmp_path,
+            sandbox_base,
+            "profile-denial",
+            "Run exactly this shell command, then stop: "
+            f"if /usr/bin/test -r {sentinel}; then printf CRED_VISIBLE; "
+            "else printf CRED_BLOCKED; fi; "
+            "printf 'allowed\\n' > allowed.txt",
+            allowed_paths=("allowed.txt",),
+        )
+        result = launcher.run(task, grant)
+        events = command_events(result.effect.stdout)
+        output = "\n".join(str(event.get("aggregated_output", "")) for event in events)
+        assert result.effect.status is DispatchStatus.COMPLETED, result.effect.stdout
+        assert "CRED_BLOCKED" in output and "CRED_VISIBLE" not in output, (
+            result.effect.stdout
+        )
+        assert (task.approved_root / "allowed.txt").read_text() == "allowed\n"
+    finally:
+        subprocess.run(
+            (
+                str(LIMACTL),
+                "shell",
+                "codex-worker",
+                "--",
+                "/bin/rm",
+                "-f",
+                str(sentinel),
+            ),
+            shell=False,
+            capture_output=True,
+            check=False,
+        )
+        if journal is not None:
+            journal.close()
+
+
+def test_real_lima_analysis_profile_denies_workspace_writes(
+    tmp_path: Path, sandbox_base: Path
+) -> None:
+    """Proves analysis workers can inspect but cannot create a workspace delta."""
+    launcher, task, grant, _, journal = configured_worker(
+        tmp_path,
+        sandbox_base,
+        "analysis-no-write",
+        "Run exactly this shell command, then stop: "
+        "if printf forbidden > analysis.txt; then printf ANALYSIS_WROTE; "
+        "else printf ANALYSIS_BLOCKED; fi",
+        allowed_paths=("analysis.txt",),
+        kind=WorkerKind.ANALYSIS,
+    )
+
+    result = launcher.run(task, grant)
+
+    events = command_events(result.effect.stdout)
+    output = "\n".join(str(event.get("aggregated_output", "")) for event in events)
+    assert result.effect.status is DispatchStatus.COMPLETED, result.effect.stdout
+    assert "ANALYSIS_BLOCKED" in output and "ANALYSIS_WROTE" not in output, (
+        result.effect.stdout
+    )
+    assert not (task.approved_root / "analysis.txt").exists()
+    assert result.changed_paths == ()
+    journal.close()
+
+
+def test_real_lima_codex_auth_survives_while_child_network_is_denied(
+    tmp_path: Path, sandbox_base: Path
+) -> None:
+    """Proves model auth works while a child cannot mutate a guest-local endpoint."""
+    port = 18766
+    log_path = f"/tmp/cdd-http-{port}.log"
+    started = subprocess.run(
+        (
+            str(LIMACTL),
+            "shell",
+            "codex-worker",
+            "--",
+            "/bin/sh",
+            "-c",
+            (
+                f"/usr/bin/python3 -m http.server {port} --bind 127.0.0.1 "
+                f">{log_path} 2>&1 & echo $!"
+            ),
+        ),
+        shell=False,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert started.returncode == 0, started.stderr
+    server_pid = started.stdout.strip()
+    assert server_pid.isdigit()
+    journal: Journal | None = None
+    try:
+        time.sleep(1)
+        alive = subprocess.run(
+            (
+                str(LIMACTL),
+                "shell",
+                "codex-worker",
+                "--",
+                "/bin/kill",
+                "-0",
+                server_pid,
+            ),
+            shell=False,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert alive.returncode == 0, "guest loopback server failed to start"
+        launcher, task, grant, _, journal = configured_worker(
+            tmp_path,
+            sandbox_base,
+            "network-denial",
+            "Run exactly this shell command, then stop: "
+            f"/usr/bin/curl -fsS -X POST --data sandbox-probe "
+            f"http://127.0.0.1:{port}/mutation && printf NETWORK_REACHED "
+            "|| printf NETWORK_BLOCKED",
+            allowed_paths=("approved.txt",),
+        )
+        result = launcher.run(task, grant)
+        events = command_events(result.effect.stdout)
+        assert result.effect.status is DispatchStatus.COMPLETED, result.effect.stdout
+        assert any(
+            "NETWORK_BLOCKED" in str(event.get("aggregated_output", ""))
+            for event in events
+        ), result.effect.stdout
+    finally:
+        subprocess.run(
+            (
+                str(LIMACTL),
+                "shell",
+                "codex-worker",
+                "--",
+                "/bin/kill",
+                server_pid,
+            ),
+            shell=False,
+            capture_output=True,
+            check=False,
+        )
+        observed = subprocess.run(
+            (
+                str(LIMACTL),
+                "shell",
+                "codex-worker",
+                "--",
+                "/bin/cat",
+                log_path,
+            ),
+            shell=False,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        subprocess.run(
+            (
+                str(LIMACTL),
+                "shell",
+                "codex-worker",
+                "--",
+                "/bin/rm",
+                "-f",
+                log_path,
+            ),
+            shell=False,
+            capture_output=True,
+            check=False,
+        )
+        if journal is not None:
+            journal.close()
+    assert "POST /mutation" not in observed.stdout + observed.stderr
+
+
+def test_real_lima_timeout_cancels_remote_codex_and_cleans_workspace(
+    tmp_path: Path, sandbox_base: Path
+) -> None:
+    """Proves a stale host fence cannot leave the guest Codex process alive."""
+    effect_id = f"timeout-{sandbox_base.name}"
+    launcher, task, grant, _, journal = configured_worker(
+        tmp_path,
+        sandbox_base,
+        effect_id,
+        "Run exactly this shell command, then stop: sleep 60",
+        allowed_paths=("approved.txt",),
+        timeout_seconds=2,
+    )
+
+    result = launcher.run(task, grant)
+
+    assert result.effect.status is DispatchStatus.RECONCILIATION_REQUIRED
+    effect = journal.get_effect(effect_id, effect_id)
+    assert effect is not None and effect.state is EffectState.STARTED
+    cleanup = subprocess.run(
+        (
+            str(LIMACTL),
+            "shell",
+            "codex-worker",
+            "--",
+            "/bin/sh",
+            "-c",
+            (
+                "test -e "
+                f"{GUEST_WORKSPACES}/.cdd-control/{effect_id}.cancelled && "
+                "test ! -e "
+                f"{GUEST_WORKSPACES}/.cdd-control/{effect_id}.json && "
+                'test -z "$(find '
+                f"{GUEST_WORKSPACES} -maxdepth 1 -name '{effect_id}-*' -print -quit)\""
+            ),
+        ),
+        shell=False,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert cleanup.returncode == 0, cleanup.stderr
+    journal.close()

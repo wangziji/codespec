@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import dataclasses
+import os
+import shutil
 import subprocess
-from datetime import datetime, timedelta, timezone
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+
 from codex_contract_delivery.capabilities import (
     CapabilityBroker,
     CapabilityDenied,
@@ -26,13 +30,14 @@ from codex_contract_delivery.state_machine import RunEvent, RunState
 
 DIGEST_A = "a" * 64
 DIGEST_B = "b" * 64
+DIGEST_C = "c" * 64
 PRINTF = str(Path("/usr/bin/printf").resolve())
 ENV = str(Path("/usr/bin/env").resolve())
 
 
 class MutableClock:
     def __init__(self) -> None:
-        self.now = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+        self.now = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
 
     def __call__(self) -> datetime:
         return self.now
@@ -45,13 +50,15 @@ def policy_record(
     root: Path,
     *,
     executable: str = PRINTF,
-    capability: str = "worker.implementation",
+    capability: str = "local.execute",
     operation: str = "write",
     resource_pattern: str | None = None,
     allowed_environment_names: list[str] | None = None,
+    timeout_seconds: int = 30,
 ) -> dict[str, object]:
     return {
         "schema_version": "1.0",
+        "workflow_release_digest": DIGEST_B,
         "policies": [
             {
                 "policy_id": "worker-implementation-v1",
@@ -62,7 +69,7 @@ def policy_record(
                 "required_run_state": "discovery",
                 "approval_digest": DIGEST_A,
                 "actor_class": "controller",
-                "timeout_seconds": 30,
+                "timeout_seconds": timeout_seconds,
                 "idempotency_strategy": "effect-id",
                 "reconciliation_strategy": "journal-probe",
                 "allowed_environment_names": allowed_environment_names or [],
@@ -104,9 +111,11 @@ def seed(
 def request(root: Path, **changes: object) -> CapabilityRequest:
     values: dict[str, object] = {
         "source": "controller",
-        "capability": "worker.implementation",
+        "capability": "local.execute",
         "resource": str(root),
         "operation": "write",
+        "requested_argv": (PRINTF, "ok"),
+        "task_fingerprint": DIGEST_C,
     }
     values.update(changes)
     return CapabilityRequest(**values)
@@ -292,7 +301,9 @@ def test_dispatch_denies_resource_replaced_by_symlink_after_authorization(
     broker = CapabilityBroker(
         CapabilityPolicy.from_mapping(policy_record(approved)), journal, clock=clock
     )
-    grant = broker.authorize(request(approved), context)
+    grant = broker.authorize(
+        request(approved, requested_argv=(PRINTF, "should-not-run")), context
+    )
     moved = tmp_path / "moved"
     approved.rename(moved)
     approved.symlink_to(moved, target_is_directory=True)
@@ -361,7 +372,13 @@ def test_dispatch_filters_external_credentials_and_injects_only_effect_key(
         CapabilityPolicy.from_mapping(policy), journal, clock=clock
     )
     grant = broker.authorize(
-        request(tmp_path, capability="inspect", operation="read"), context
+        request(
+            tmp_path,
+            capability="inspect",
+            operation="read",
+            requested_argv=(ENV,),
+        ),
+        context,
     )
 
     result = broker.dispatch(grant, (ENV,))
@@ -397,6 +414,7 @@ def test_nonfilesystem_mutation_stays_broker_owned_without_fake_write_root(
             capability="github.write",
             operation="write",
             resource="github://example/repository",
+            requested_argv=(PRINTF, "ok"),
         ),
         context,
     )
@@ -427,7 +445,9 @@ def test_dispatch_records_started_before_call_and_completion_evidence(
         clock=clock,
         process_runner=runner,
     )
-    grant = broker.authorize(request(tmp_path), context)
+    grant = broker.authorize(
+        request(tmp_path, requested_argv=(PRINTF, "done")), context
+    )
 
     result = broker.dispatch(grant, (PRINTF, "done"))
 
@@ -456,7 +476,9 @@ def test_dispatch_timeout_enters_typed_reconciliation_without_redispatch(
         clock=clock,
         process_runner=timeout,
     )
-    grant = broker.authorize(request(tmp_path), context)
+    grant = broker.authorize(
+        request(tmp_path, requested_argv=(PRINTF, "slow")), context
+    )
 
     result = broker.dispatch(grant, (PRINTF, "slow"))
 
@@ -466,4 +488,384 @@ def test_dispatch_timeout_enters_typed_reconciliation_without_redispatch(
     assert journal.get_effect("run-1", "effect-1").state is EffectState.STARTED
     with pytest.raises(CapabilityDenied, match="already dispatched"):
         broker.dispatch(grant, (PRINTF, "slow"))
+    journal.close()
+
+
+def test_policy_release_is_live_authority_and_invalidates_old_grant(
+    tmp_path: Path,
+) -> None:
+    """Would fail if the caller could self-report a release or reuse a stale grant."""
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+    current = policy_record(tmp_path)
+    current["workflow_release_digest"] = DIGEST_B
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(current), journal, clock=clock
+    )
+    grant = broker.authorize(request(tmp_path), context)
+
+    switched = policy_record(tmp_path)
+    switched["workflow_release_digest"] = DIGEST_C
+    broker.policy = CapabilityPolicy.from_mapping(switched)
+
+    with pytest.raises(CapabilityDenied, match="release"):
+        broker.dispatch(grant, (PRINTF, "ok"))
+    with pytest.raises(CapabilityDenied, match="release"):
+        broker.authorize(request(tmp_path), context)
+    journal.close()
+
+
+def test_authorization_denial_audit_contains_nonsecret_authority_context(
+    tmp_path: Path,
+) -> None:
+    """Would fail if broker-owned denial evidence lacked the deciding context."""
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(policy_record(tmp_path)), journal, clock=clock
+    )
+    denied = request(tmp_path, capability="external.network")
+
+    with pytest.raises(CapabilityDenied):
+        broker.authorize(denied, context)
+
+    decision = broker.decisions[-1]
+    assert decision.allowed is False
+    assert decision.capability == "external.network"
+    assert decision.resource == str(tmp_path)
+    assert decision.run_id == "run-1"
+    assert decision.revision == 1
+    assert decision.policy_digest == broker.policy.digest
+    assert not hasattr(decision, "requested_argv")
+    journal.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("allowed_environment_names", ["PATH", "PATH"]),
+        ("allowed_write_roots", ["ROOT", "ROOT"]),
+    ],
+)
+def test_runtime_rejects_duplicate_scopes_like_schema(
+    tmp_path: Path, field: str, value: list[str]
+) -> None:
+    """Would fail while runtime silently normalized an ambiguous duplicate scope."""
+    record = policy_record(tmp_path)
+    record["policies"][0][field] = [
+        str(tmp_path) if item == "ROOT" else item for item in value
+    ]
+
+    with pytest.raises(PolicyInvalid, match="duplicate"):
+        CapabilityPolicy.from_mapping(record)
+
+
+def test_policy_rejects_executable_inside_worker_write_scope(tmp_path: Path) -> None:
+    """Would fail if a worker could replace the executable it is about to run."""
+    executable = tmp_path / "worker-writable-tool"
+    shutil.copyfile(PRINTF, executable)
+    executable.chmod(0o755)
+
+    with pytest.raises(PolicyInvalid, match="executable.*write root"):
+        CapabilityPolicy.from_mapping(
+            policy_record(tmp_path, executable=str(executable))
+        )
+
+
+@pytest.mark.parametrize("mutation", ["replace", "symlink", "in-place"])
+def test_dispatch_rejects_executable_identity_mutation(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Would fail if an authorized executable could be replaced before spawn."""
+    trusted_root = tmp_path.parent / f"{tmp_path.name}-trusted"
+    trusted_root.mkdir()
+    executable = trusted_root / "approved-tool"
+    shutil.copyfile(PRINTF, executable)
+    executable.chmod(0o755)
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(
+            policy_record(tmp_path, executable=str(executable))
+        ),
+        journal,
+        clock=clock,
+        process_runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, "", ""
+        ),
+    )
+    grant = broker.authorize(
+        request(tmp_path, requested_argv=(str(executable), "ok")), context
+    )
+
+    if mutation == "replace":
+        replacement = trusted_root / "replacement"
+        shutil.copyfile(ENV, replacement)
+        replacement.chmod(0o755)
+        os.replace(replacement, executable)
+    elif mutation == "symlink":
+        executable.unlink()
+        executable.symlink_to(ENV)
+    else:
+        with executable.open("r+b") as stream:
+            first = stream.read(1)
+            stream.seek(0)
+            stream.write(b"X" if first != b"X" else b"Y")
+
+    with pytest.raises(CapabilityDenied, match="executable"):
+        broker.dispatch(grant, (str(executable), "ok"))
+    assert journal.get_effect("run-1", "effect-1").state is EffectState.INTENT
+    journal.close()
+
+
+def test_lease_covers_latest_legal_dispatch_deadline(tmp_path: Path) -> None:
+    """Would fail if a delayed but valid grant could lose its fence mid-process."""
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(policy_record(tmp_path)),
+        journal,
+        clock=clock,
+        process_runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, "", ""
+        ),
+    )
+    grant = broker.authorize(request(tmp_path), context)
+    assert grant.lease_expires_at >= grant.expires_at + timedelta(seconds=30.5)
+
+    clock.advance(timedelta(seconds=29))
+    result = broker.dispatch(grant, (PRINTF, "ok"))
+
+    assert result.status is DispatchStatus.COMPLETED
+    assert journal.get_effect("run-1", "effect-1").state is EffectState.COMPLETED
+    journal.close()
+
+
+def test_timeout_kills_entire_process_group_before_return(tmp_path: Path) -> None:
+    """Would fail if a timed-out grandchild could mutate state after reconciliation."""
+    marker = tmp_path / "late-write"
+    trusted_root = tmp_path.parent / f"{tmp_path.name}-trusted"
+    trusted_root.mkdir()
+    executable = trusted_root / "process-tree"
+    executable.write_text(
+        "#!/usr/bin/python3\n"
+        "import os, signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "if os.fork() == 0:\n"
+        "    time.sleep(2)\n"
+        f"    open({str(marker)!r}, 'w').write('late')\n"
+        "    os._exit(0)\n"
+        "time.sleep(20)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    journal = Journal.open(tmp_path / "tree.sqlite3")
+    result = journal.transition(
+        TransitionRequest(
+            "run-1",
+            0,
+            RunEvent.DISCOVER,
+            {},
+            EffectIntent("effect-1", "worker"),
+        )
+    )
+    context = RunContext(
+        "run-1",
+        result.run.revision,
+        RunState.DISCOVERY,
+        DIGEST_B,
+        DIGEST_A,
+        "controller",
+        "effect-1",
+        "controller-1",
+    )
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(
+            policy_record(tmp_path, executable=str(executable), timeout_seconds=1)
+        ),
+        journal,
+    )
+    grant = broker.authorize(
+        request(tmp_path, requested_argv=(str(executable),)), context
+    )
+
+    effect = broker.dispatch(grant, (str(executable),))
+    time.sleep(2.1)
+
+    assert effect.status is DispatchStatus.RECONCILIATION_REQUIRED
+    assert not marker.exists()
+    journal.close()
+
+
+def test_lima_worker_authorization_requires_exact_guest_wrapper_grammar(
+    tmp_path: Path,
+) -> None:
+    """Would fail if direct broker callers could extend the VM worker wrapper."""
+    trusted_root = tmp_path.parent / f"{tmp_path.name}-trusted"
+    trusted_root.mkdir()
+    limactl = trusted_root / "limactl"
+    limactl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    limactl.chmod(0o755)
+    prefix = (
+        str(limactl),
+        "shell",
+        "codex-worker",
+        "--",
+        "/usr/bin/python3",
+        "/readonly/vm_guest.py",
+        "--workspace-base",
+        "/home/mark.guest/.local/share/cdd/workspaces",
+    )
+    record = policy_record(tmp_path, executable=str(limactl))
+    record["policies"][0]["capability"] = "worker.implementation"
+    record["policies"][0]["allowed_argv_prefix"] = list(prefix)
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(record), journal, clock=clock
+    )
+    expected = (
+        *prefix,
+        "--source-root",
+        str(tmp_path),
+        "--kind",
+        "implementation",
+        "--task-fingerprint",
+        DIGEST_C,
+        "--json",
+    )
+
+    with pytest.raises(CapabilityDenied, match="worker command|danger"):
+        broker.authorize(
+            request(
+                tmp_path,
+                capability="worker.implementation",
+                requested_argv=(*expected, "--add-dir", "/tmp"),
+            ),
+            context,
+        )
+
+    grant = broker.authorize(
+        request(
+            tmp_path,
+            capability="worker.implementation",
+            requested_argv=expected,
+        ),
+        context,
+    )
+    assert grant.canonical_argv == expected
+    journal.close()
+
+
+def test_result_validator_denial_is_recorded_in_broker_audit(tmp_path: Path) -> None:
+    """Would fail if rejected external output left only unaudited exception evidence."""
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(policy_record(tmp_path)),
+        journal,
+        clock=clock,
+        process_runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, "", ""
+        ),
+    )
+    grant = broker.authorize(request(tmp_path), context)
+
+    with pytest.raises(RuntimeError, match="export denied"):
+        broker._dispatch(
+            grant,
+            (PRINTF, "ok"),
+            result_validator=lambda completed: (_ for _ in ()).throw(
+                RuntimeError("export denied")
+            ),
+        )
+
+    decision = broker.decisions[-1]
+    assert decision.allowed is False
+    assert decision.reason_code == "result-policy-violation"
+    assert decision.capability == "local.execute"
+    assert decision.run_id == "run-1"
+    assert journal.get_effect("run-1", "effect-1").state is EffectState.COMPLETED
+    journal.close()
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "expected"),
+    [
+        (2, "", DispatchStatus.FAILED),
+        (
+            0,
+            (
+                '{"item":{"type":"command_execution","status":"failed",'
+                '"exit_code":1,"aggregated_output":"Operation not permitted"}}\n'
+            ),
+            DispatchStatus.DENIED,
+        ),
+    ],
+)
+def test_failed_or_denied_worker_never_invokes_export_validator(
+    tmp_path: Path,
+    returncode: int,
+    stdout: str,
+    expected: DispatchStatus,
+) -> None:
+    """Would fail if a partial patch could be imported from a failed guest."""
+    trusted_root = tmp_path.parent / f"{tmp_path.name}-trusted"
+    trusted_root.mkdir()
+    executable = trusted_root / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    command = (
+        str(executable),
+        "exec",
+        "--sandbox",
+        "workspace-write",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--cd",
+        str(tmp_path),
+        "--json",
+        "-",
+    )
+    record = policy_record(
+        tmp_path,
+        executable=str(executable),
+        capability="worker.implementation",
+    )
+    record["policies"][0]["allowed_argv_prefix"] = [str(executable), "exec"]
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(record),
+        journal,
+        clock=clock,
+        process_runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, returncode, stdout, ""
+        ),
+    )
+    grant = broker.authorize(
+        request(
+            tmp_path,
+            capability="worker.implementation",
+            requested_argv=command,
+        ),
+        context,
+    )
+    validator_calls = 0
+
+    def validator(completed: subprocess.CompletedProcess[str]) -> object:
+        nonlocal validator_calls
+        validator_calls += 1
+        return object()
+
+    result, validation = broker._dispatch(
+        grant,
+        command,
+        result_validator=validator,
+    )
+
+    assert result.status is expected
+    assert validation is None
+    assert validator_calls == 0
     journal.close()

@@ -1,34 +1,47 @@
 schema_version: "1.0"
+workflow_release_digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 policies:
   - policy_id: worker-analysis-v1
     capability: worker.analysis
     operation: read
-    resource_pattern: /approved/worktrees/example
+    resource_pattern: /approved/readonly-mount/worktrees/example
     allowed_argv_prefix:
-      - /Applications/ChatGPT.app/Contents/Resources/codex
-      - exec
+      - /opt/homebrew/bin/limactl
+      - shell
+      - codex-worker
+      - --
+      - /usr/bin/python3
+      - /approved/readonly-mount/codex-contract-delivery/src/codex_contract_delivery/vm_guest.py
+      - --workspace-base
+      - /home/codex-worker/.local/share/cdd/workspaces
     required_run_state: discovery
     approval_digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     actor_class: controller
     timeout_seconds: 120
     idempotency_strategy: effect-id
     reconciliation_strategy: journal-probe
-    # HOME/CODEX_HOME expose only Codex platform authentication. External-service
-    # credentials remain filtered and are never copied into worker context.
-    allowed_environment_names: [HOME, PATH, LANG, LC_ALL, CODEX_HOME]
+    # HOME locates broker-owned Lima state on the host. Codex authentication is
+    # guest-owned and no host CODEX_HOME or external-service credential is copied.
+    allowed_environment_names: [HOME, PATH, TMPDIR]
     allowed_write_roots: []
   - policy_id: worker-implementation-v1
     capability: worker.implementation
     operation: write
-    resource_pattern: /approved/worktrees/example
+    resource_pattern: /approved/readonly-mount/worktrees/example
     allowed_argv_prefix:
-      - /Applications/ChatGPT.app/Contents/Resources/codex
-      - exec
+      - /opt/homebrew/bin/limactl
+      - shell
+      - codex-worker
+      - --
+      - /usr/bin/python3
+      - /approved/readonly-mount/codex-contract-delivery/src/codex_contract_delivery/vm_guest.py
+      - --workspace-base
+      - /home/codex-worker/.local/share/cdd/workspaces
     required_run_state: implementation
     approval_digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     actor_class: controller
     timeout_seconds: 120
     idempotency_strategy: effect-id
     reconciliation_strategy: journal-probe
-    allowed_environment_names: [HOME, PATH, LANG, LC_ALL, CODEX_HOME]
-    allowed_write_roots: [/approved/worktrees/example]
+    allowed_environment_names: [HOME, PATH, TMPDIR]
+    allowed_write_roots: [/approved/readonly-mount/worktrees/example]

@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import signal
+import stat
 import subprocess
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import Enum
+from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any
@@ -34,6 +39,8 @@ class PolicyInvalid(ValueError):
 
 class DispatchStatus(str, Enum):
     COMPLETED = "completed"
+    DENIED = "denied"
+    FAILED = "failed"
     RECONCILIATION_REQUIRED = "reconciliation_required"
 
 
@@ -57,10 +64,12 @@ _FORBIDDEN_ENV_PARTS = (
     "BEARER",
 )
 _FORBIDDEN_ENV_PREFIXES = ("AWS_", "GITHUB_", "DB_", "DATABASE_")
+_TERM_GRACE_SECONDS = 0.25
+_KILL_GRACE_SECONDS = 0.25
 
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _require_text(name: str, value: object) -> str:
@@ -153,25 +162,94 @@ def _is_sensitive_environment_name(name: str) -> bool:
 
 
 @dataclass(frozen=True)
+class ExecutableIdentity:
+    device: int
+    inode: int
+    mode: int
+    size: int
+    mtime_ns: int
+    content_sha256: str
+
+    def canonical_record(self) -> dict[str, object]:
+        return {
+            "device": self.device,
+            "inode": self.inode,
+            "mode": self.mode,
+            "size": self.size,
+            "mtime_ns": self.mtime_ns,
+            "content_sha256": self.content_sha256,
+        }
+
+
+def _hash_fd(fd: int) -> str:
+    digest = sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(fd, 1024 * 1024, offset)
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
+        offset += len(chunk)
+
+
+def _open_executable(path: str) -> tuple[int, ExecutableIdentity]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise PolicyInvalid("allowed executable cannot be opened safely") from error
+    try:
+        details = os.fstat(fd)
+        if not stat.S_ISREG(details.st_mode) or details.st_mode & 0o111 == 0:
+            raise PolicyInvalid("allowed executable is not an executable file")
+        identity = ExecutableIdentity(
+            details.st_dev,
+            details.st_ino,
+            details.st_mode,
+            details.st_size,
+            details.st_mtime_ns,
+            _hash_fd(fd),
+        )
+        return fd, identity
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+@dataclass(frozen=True)
 class CapabilityRequest:
     source: str
     capability: str
     resource: str
     operation: str
+    requested_argv: tuple[str, ...] = ()
+    task_fingerprint: str = ""
 
     def __post_init__(self) -> None:
         for name in ("source", "capability", "resource", "operation"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} must be a non-empty string")
+        if isinstance(self.requested_argv, str | bytes) or any(
+            not isinstance(item, str) for item in self.requested_argv
+        ):
+            raise ValueError("requested_argv must be a sequence of strings")
+        object.__setattr__(self, "requested_argv", tuple(self.requested_argv))
+        if (
+            not isinstance(self.task_fingerprint, str)
+            or _DIGEST.fullmatch(self.task_fingerprint) is None
+        ):
+            raise ValueError("task_fingerprint must be a lowercase SHA-256 digest")
 
-    def canonical_record(self) -> Mapping[str, str]:
+    def canonical_record(self) -> Mapping[str, object]:
         return MappingProxyType(
             {
                 "source": self.source,
                 "capability": self.capability,
                 "resource": self.resource,
                 "operation": self.operation,
+                "requested_argv": self.requested_argv,
+                "task_fingerprint": self.task_fingerprint,
             }
         )
 
@@ -216,6 +294,8 @@ class CapabilityRule:
     reconciliation_strategy: str
     allowed_environment_names: tuple[str, ...]
     allowed_write_roots: tuple[str, ...]
+    executable_identity: ExecutableIdentity
+    executable_fd: int
 
     def canonical_record(self) -> dict[str, object]:
         return {
@@ -232,10 +312,11 @@ class CapabilityRule:
             "reconciliation_strategy": self.reconciliation_strategy,
             "allowed_environment_names": self.allowed_environment_names,
             "allowed_write_roots": self.allowed_write_roots,
+            "executable_identity": self.executable_identity.canonical_record(),
         }
 
 
-_TOP_LEVEL_FIELDS = frozenset({"schema_version", "policies"})
+_TOP_LEVEL_FIELDS = frozenset({"schema_version", "workflow_release_digest", "policies"})
 _RULE_FIELDS = frozenset(
     {
         "policy_id",
@@ -258,6 +339,7 @@ _RULE_FIELDS = frozenset(
 @dataclass(frozen=True)
 class CapabilityPolicy:
     schema_version: str
+    workflow_release_digest: str
     rules: tuple[CapabilityRule, ...]
     digest: str
 
@@ -270,6 +352,9 @@ class CapabilityPolicy:
             raise PolicyInvalid(f"unknown field: {min(unknown)}")
         if value.get("schema_version") != "1.0":
             raise PolicyInvalid("schema_version must be 1.0")
+        workflow_release_digest = _require_digest(
+            "workflow_release_digest", value.get("workflow_release_digest")
+        )
         raw_rules = value.get("policies")
         if not isinstance(raw_rules, list) or not raw_rules:
             raise PolicyInvalid("policies must be a non-empty list")
@@ -313,10 +398,6 @@ class CapabilityPolicy:
                 executable_realpath = str(executable.resolve(strict=True))
             except OSError as error:
                 raise PolicyInvalid("allowed executable does not exist") from error
-            if not Path(executable_realpath).is_file() or not os.access(
-                executable_realpath, os.X_OK
-            ):
-                raise PolicyInvalid("allowed executable is not executable")
             prefix = (executable_realpath, *(str(item) for item in raw_prefix[1:]))
             try:
                 required_state = RunState(raw["required_run_state"])
@@ -339,6 +420,8 @@ class CapabilityPolicy:
                 for item in environment
             ):
                 raise PolicyInvalid("allowed_environment_names must contain safe names")
+            if len(environment) != len(set(environment)):
+                raise PolicyInvalid("allowed_environment_names contains a duplicate")
             raw_roots = raw["allowed_write_roots"]
             if not isinstance(raw_roots, list) or any(
                 not isinstance(item, str) or not Path(item).is_absolute()
@@ -357,12 +440,19 @@ class CapabilityPolicy:
                     raise PolicyInvalid("allowed_write_roots cannot contain a symlink")
                 roots_list.append(str(resolved_root))
             roots = tuple(roots_list)
+            if len(roots) != len(set(roots)):
+                raise PolicyInvalid("allowed_write_roots contains a duplicate")
             resource_pattern = _validate_resource_pattern(raw["resource_pattern"])
             path_pattern = resource_pattern.removesuffix("/**")
             if operation != "read" and _is_path_resource(path_pattern) and not roots:
                 raise PolicyInvalid(
                     "filesystem mutation policies require at least one allowed write root"
                 )
+            if any(_within(executable_realpath, root) for root in roots):
+                raise PolicyInvalid(
+                    "allowed executable cannot be inside an allowed write root"
+                )
+            executable_fd, executable_identity = _open_executable(executable_realpath)
             rules.append(
                 CapabilityRule(
                     policy_id,
@@ -376,15 +466,23 @@ class CapabilityPolicy:
                     timeout,
                     "effect-id",
                     "journal-probe",
-                    tuple(dict.fromkeys(environment)),
-                    tuple(dict.fromkeys(roots)),
+                    tuple(environment),
+                    roots,
+                    executable_identity,
+                    executable_fd,
                 )
             )
         record = {
             "schema_version": "1.0",
+            "workflow_release_digest": workflow_release_digest,
             "policies": [rule.canonical_record() for rule in rules],
         }
-        return cls("1.0", tuple(rules), canonical_digest(record))
+        return cls(
+            "1.0",
+            workflow_release_digest,
+            tuple(rules),
+            canonical_digest(record),
+        )
 
 
 @dataclass(frozen=True)
@@ -398,7 +496,11 @@ class Grant:
     resource: str
     actor_class: str
     allowed_argv_prefix: tuple[str, ...]
+    canonical_argv: tuple[str, ...]
+    argv_digest: str
+    task_fingerprint: str
     executable_realpath: str
+    executable_identity: ExecutableIdentity
     allowed_environment_names: tuple[str, ...]
     allowed_write_roots: tuple[str, ...]
     timeout_seconds: int
@@ -414,6 +516,7 @@ class Grant:
     worker_id: str
     issued_at: datetime
     expires_at: datetime
+    lease_expires_at: datetime
 
     def _content(self) -> dict[str, object]:
         return {
@@ -425,7 +528,11 @@ class Grant:
             "resource": self.resource,
             "actor_class": self.actor_class,
             "allowed_argv_prefix": self.allowed_argv_prefix,
+            "canonical_argv": self.canonical_argv,
+            "argv_digest": self.argv_digest,
+            "task_fingerprint": self.task_fingerprint,
             "executable_realpath": self.executable_realpath,
+            "executable_identity": self.executable_identity.canonical_record(),
             "allowed_environment_names": self.allowed_environment_names,
             "allowed_write_roots": self.allowed_write_roots,
             "timeout_seconds": self.timeout_seconds,
@@ -441,6 +548,7 @@ class Grant:
             "worker_id": self.worker_id,
             "issued_at": self.issued_at.isoformat(),
             "expires_at": self.expires_at.isoformat(),
+            "lease_expires_at": self.lease_expires_at.isoformat(),
         }
 
     def verify_digest(self) -> bool:
@@ -453,6 +561,11 @@ class BrokerDecision:
     allowed: bool
     reason_code: str
     observed_at: datetime
+    capability: str = ""
+    resource: str = ""
+    run_id: str = ""
+    revision: int = -1
+    policy_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -468,6 +581,7 @@ class EffectResult:
 
 ProcessRunner = Callable[..., subprocess.CompletedProcess[str]]
 ResultValidator = Callable[[subprocess.CompletedProcess[str]], object]
+AuditSink = Callable[[BrokerDecision], None]
 
 
 class CapabilityBroker:
@@ -479,14 +593,17 @@ class CapabilityBroker:
         journal: Journal,
         *,
         clock: Callable[[], datetime] | None = None,
-        process_runner: ProcessRunner = subprocess.run,
+        process_runner: ProcessRunner | None = None,
         environment: Mapping[str, str] | None = None,
+        audit_sink: AuditSink | None = None,
     ) -> None:
         self.policy = policy
         self.journal = journal
         self._clock = clock or _utc_now
-        self._process_runner = process_runner
+        self._uses_real_runner = process_runner is None
+        self._process_runner = process_runner or self._run_process_tree
         self._environment = dict(os.environ if environment is None else environment)
+        self._audit_sink = audit_sink
         self._issued: dict[str, Grant] = {}
         self._decisions: list[BrokerDecision] = []
 
@@ -494,24 +611,75 @@ class CapabilityBroker:
     def decisions(self) -> tuple[BrokerDecision, ...]:
         return tuple(self._decisions)
 
-    def _deny(self, request_digest: str, code: str, message: str) -> None:
-        self._decisions.append(
-            BrokerDecision(request_digest, False, code, self._clock())
+    def _record_decision(self, decision: BrokerDecision) -> None:
+        self._decisions.append(decision)
+        if self._audit_sink is not None:
+            self._audit_sink(decision)
+
+    def _deny(
+        self,
+        request_digest: str,
+        code: str,
+        message: str,
+        *,
+        request: CapabilityRequest | None = None,
+        context: RunContext | None = None,
+        grant: Grant | None = None,
+    ) -> None:
+        self._record_decision(
+            BrokerDecision(
+                request_digest,
+                False,
+                code,
+                self._clock(),
+                request.capability
+                if request is not None
+                else grant.capability
+                if grant
+                else "",
+                request.resource
+                if request is not None
+                else grant.resource
+                if grant
+                else "",
+                context.run_id
+                if context is not None
+                else grant.run_id
+                if grant
+                else "",
+                context.revision
+                if context is not None
+                else grant.run_revision
+                if grant
+                else -1,
+                self.policy.digest,
+            )
         )
         raise CapabilityDenied(message)
 
     def authorize(self, request: CapabilityRequest, context: RunContext) -> Grant:
         request_digest = canonical_digest(request.canonical_record())
-        if request.source == "extension" and request.operation != "read":
+
+        def deny(code: str, message: str) -> None:
             self._deny(
                 request_digest,
+                code,
+                message,
+                request=request,
+                context=context,
+            )
+
+        if context.workflow_release_digest != self.policy.workflow_release_digest:
+            deny("workflow-release-mismatch", "workflow release does not match policy")
+        if request.source == "extension" and request.operation != "read":
+            deny(
                 "untrusted-source-mutation",
                 "extension payloads cannot request mutating capabilities",
             )
         try:
             _validate_resource(request.resource)
         except CapabilityDenied as error:
-            self._deny(request_digest, "unsafe-resource", str(error))
+            deny("unsafe-resource", str(error))
         candidates = [
             rule
             for rule in self.policy.rules
@@ -519,22 +687,19 @@ class CapabilityBroker:
             and rule.operation == request.operation
         ]
         if not candidates:
-            self._deny(
-                request_digest, "unknown-capability", "capability is not allowed"
-            )
+            deny("unknown-capability", "capability is not allowed")
         actor_candidates = [
             rule for rule in candidates if rule.actor_class == context.actor_class
         ]
         if not actor_candidates:
-            self._deny(request_digest, "actor-mismatch", "actor class is not allowed")
+            deny("actor-mismatch", "actor class is not allowed")
         approval_candidates = [
             rule
             for rule in actor_candidates
             if rule.approval_digest == context.approval_digest
         ]
         if not approval_candidates:
-            self._deny(
-                request_digest,
+            deny(
                 "approval-mismatch",
                 "approval digest does not match policy",
             )
@@ -544,9 +709,7 @@ class CapabilityBroker:
             if rule.required_run_state is context.state
         ]
         if not state_candidates:
-            self._deny(
-                request_digest, "state-mismatch", "run state does not match policy"
-            )
+            deny("state-mismatch", "run state does not match policy")
         matches = [
             rule
             for rule in state_candidates
@@ -558,7 +721,7 @@ class CapabilityBroker:
                 if not matches
                 else "capability policy is ambiguous"
             )
-            self._deny(request_digest, "resource-mismatch", reason)
+            deny("resource-mismatch", reason)
         rule = matches[0]
         snapshot = self.journal.get_run(context.run_id)
         if (
@@ -566,8 +729,7 @@ class CapabilityBroker:
             or snapshot.revision != context.revision
             or snapshot.state is not context.state
         ):
-            self._deny(
-                request_digest,
+            deny(
                 "run-context-drift",
                 "run context does not match journal",
             )
@@ -576,36 +738,36 @@ class CapabilityBroker:
             try:
                 resource = _canonical_path(resource)
             except CapabilityDenied as error:
-                self._deny(request_digest, "unsafe-resource", str(error))
+                deny("unsafe-resource", str(error))
         if (
             request.operation != "read"
             and _is_path_resource(resource)
             and not any(_within(resource, root) for root in rule.allowed_write_roots)
         ):
-            self._deny(
-                request_digest, "write-scope", "resource is outside allowed write roots"
-            )
+            deny("write-scope", "resource is outside allowed write roots")
+        requested_argv = self._validate_requested_argv(
+            request_digest, request, rule, resource
+        )
+        issued_at = self._clock()
+        lease_ttl = rule.timeout_seconds * 2 + _TERM_GRACE_SECONDS + _KILL_GRACE_SECONDS
         try:
             lease = self.journal.acquire_attempt(
                 context.run_id,
                 context.effect_id,
                 context.worker_id,
-                timedelta(seconds=rule.timeout_seconds + 5),
+                timedelta(seconds=lease_ttl),
             )
             lease.assert_dispatch_allowed()
         except ReconciliationRequired:
-            self._deny(
-                request_digest,
+            deny(
                 "reconciliation-required",
                 "effect requires reconciliation",
             )
         except JournalError as error:
-            self._deny(
-                request_digest,
+            deny(
                 "journal-authority",
                 f"journal denied authority: {type(error).__name__}",
             )
-        issued_at = self._clock()
         content: dict[str, Any] = {
             "request_digest": request_digest,
             "policy_digest": self.policy.digest,
@@ -615,7 +777,11 @@ class CapabilityBroker:
             "resource": resource,
             "actor_class": context.actor_class,
             "allowed_argv_prefix": rule.allowed_argv_prefix,
+            "canonical_argv": requested_argv,
+            "argv_digest": canonical_digest(requested_argv),
+            "task_fingerprint": request.task_fingerprint,
             "executable_realpath": rule.allowed_argv_prefix[0],
+            "executable_identity": rule.executable_identity,
             "allowed_environment_names": rule.allowed_environment_names,
             "allowed_write_roots": rule.allowed_write_roots,
             "timeout_seconds": rule.timeout_seconds,
@@ -631,12 +797,23 @@ class CapabilityBroker:
             "worker_id": context.worker_id,
             "issued_at": issued_at,
             "expires_at": issued_at + timedelta(seconds=rule.timeout_seconds),
+            "lease_expires_at": lease.expires_at,
         }
         provisional = Grant("", **content)
         grant = Grant(canonical_digest(provisional._content()), **content)
         self._issued[grant.grant_id] = grant
-        self._decisions.append(
-            BrokerDecision(request_digest, True, "authorized", issued_at)
+        self._record_decision(
+            BrokerDecision(
+                request_digest,
+                True,
+                "authorized",
+                issued_at,
+                request.capability,
+                request.resource,
+                context.run_id,
+                context.revision,
+                self.policy.digest,
+            )
         )
         return grant
 
@@ -649,6 +826,13 @@ class CapabilityBroker:
                 "grant-not-issued",
                 "grant was not issued by this broker",
             )
+        if grant.workflow_release_digest != self.policy.workflow_release_digest:
+            self._deny(
+                grant.request_digest,
+                "workflow-release-drift",
+                "workflow release changed",
+                grant=grant,
+            )
         if grant.policy_digest != self.policy.digest:
             self._deny(
                 grant.request_digest, "policy-drift", "capability policy changed"
@@ -656,6 +840,16 @@ class CapabilityBroker:
         now = self._clock()
         if now >= grant.expires_at:
             self._deny(grant.request_digest, "grant-expired", "grant expired")
+        required_lease_until = now + timedelta(
+            seconds=(grant.timeout_seconds + _TERM_GRACE_SECONDS + _KILL_GRACE_SECONDS)
+        )
+        if grant.lease_expires_at < required_lease_until:
+            self._deny(
+                grant.request_digest,
+                "lease-deadline",
+                "lease does not cover the complete dispatch deadline",
+                grant=grant,
+            )
         snapshot = self.journal.get_run(grant.run_id)
         if (
             snapshot is None
@@ -689,48 +883,145 @@ class CapabilityBroker:
                     "resource drifted after authorization",
                 )
 
-    def _validate_argv(self, grant: Grant, argv: Sequence[str]) -> tuple[str, ...]:
+    def _materialize_argv(
+        self, request_digest: str, argv: Sequence[str]
+    ) -> tuple[str, ...]:
         if isinstance(argv, str | bytes):
             self._deny(
-                grant.request_digest, "argv-type", "argv must be a sequence of strings"
+                request_digest, "argv-type", "argv must be a sequence of strings"
             )
         materialized = tuple(argv)
         if not materialized:
-            self._deny(grant.request_digest, "argv-empty", "argv cannot be empty")
+            self._deny(request_digest, "argv-empty", "argv cannot be empty")
         if any(not isinstance(item, str) for item in materialized):
-            self._deny(
-                grant.request_digest, "argv-type", "every argv item must be a string"
-            )
+            self._deny(request_digest, "argv-type", "every argv item must be a string")
         if any(not _safe_argv_item(item) for item in materialized):
             self._deny(
-                grant.request_digest,
+                request_digest,
                 "argv-shell-syntax",
                 "argv contains shell syntax or expansion",
             )
-        prefix = grant.allowed_argv_prefix
+        return materialized
+
+    def _validate_requested_argv(
+        self,
+        request_digest: str,
+        request: CapabilityRequest,
+        rule: CapabilityRule,
+        resource: str,
+    ) -> tuple[str, ...]:
+        materialized = self._materialize_argv(request_digest, request.requested_argv)
+        prefix = rule.allowed_argv_prefix
         if materialized[: len(prefix)] != prefix:
             self._deny(
-                grant.request_digest,
+                request_digest,
                 "argv-prefix",
                 "argv does not match the allowed prefix",
             )
+        prohibited = {
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--approve-for-me",
+            "--add-dir",
+            "--dangerously-bypass-hook-trust",
+        }
+        if (
+            prohibited.intersection(materialized)
+            or "danger-full-access" in materialized
+        ):
+            self._deny(
+                request_digest, "worker-danger-flag", "dangerous argv is forbidden"
+            )
+        if request.capability in {"worker.analysis", "worker.implementation"}:
+            mode = (
+                "read-only"
+                if request.capability == "worker.analysis"
+                else "workspace-write"
+            )
+            if (
+                Path(prefix[0]).name == "limactl"
+                and len(prefix) == 8
+                and prefix[1] == "shell"
+                and _IDENTIFIER.fullmatch(prefix[2]) is not None
+                and prefix[3] == "--"
+                and Path(prefix[4]).is_absolute()
+                and Path(prefix[5]).is_absolute()
+                and prefix[6] == "--workspace-base"
+                and Path(prefix[7]).is_absolute()
+            ):
+                expected = (
+                    *prefix,
+                    "--source-root",
+                    resource,
+                    "--kind",
+                    "analysis" if mode == "read-only" else "implementation",
+                    "--task-fingerprint",
+                    request.task_fingerprint,
+                    "--json",
+                )
+            else:
+                expected = (
+                    prefix[0],
+                    "exec",
+                    "--sandbox",
+                    mode,
+                    "--ephemeral",
+                    "--ignore-user-config",
+                    "--ignore-rules",
+                    "--cd",
+                    resource,
+                    "--json",
+                    "-",
+                )
+            if materialized != expected:
+                self._deny(
+                    request_digest,
+                    "worker-command-grammar",
+                    "worker command does not match canonical argv grammar",
+                )
+        return materialized
+
+    def _validate_argv(
+        self, grant: Grant, argv: Sequence[str]
+    ) -> tuple[tuple[str, ...], int, int]:
+        materialized = self._materialize_argv(grant.request_digest, argv)
+        if (
+            materialized != grant.canonical_argv
+            or canonical_digest(materialized) != grant.argv_digest
+        ):
+            self._deny(
+                grant.request_digest,
+                "argv-grant-mismatch",
+                "argv does not exactly match the grant",
+            )
         try:
             executable = str(Path(materialized[0]).resolve(strict=True))
-        except OSError:
+            executable_fd, identity = _open_executable(materialized[0])
+        except (OSError, PolicyInvalid):
             self._deny(
                 grant.request_digest, "unknown-executable", "executable is unavailable"
             )
-        if executable != grant.executable_realpath or not os.access(
-            executable, os.X_OK
+        rule = next(
+            (item for item in self.policy.rules if item.policy_id == grant.policy_id),
+            None,
+        )
+        if (
+            rule is None
+            or executable != grant.executable_realpath
+            or identity != grant.executable_identity
+            or rule.executable_identity != grant.executable_identity
+            or _hash_fd(rule.executable_fd) != grant.executable_identity.content_sha256
         ):
+            os.close(executable_fd)
             self._deny(
                 grant.request_digest,
                 "unknown-executable",
                 "executable identity changed",
             )
-        return materialized
+        return materialized, executable_fd, rule.executable_fd
 
-    def _child_environment(self, grant: Grant) -> dict[str, str]:
+    def _child_environment(
+        self, grant: Grant, *, isolated_home: str | None = None
+    ) -> dict[str, str]:
         environment = {
             name: self._environment[name]
             for name in grant.allowed_environment_names
@@ -738,7 +1029,150 @@ class CapabilityBroker:
         }
         environment["CDD_IDEMPOTENCY_KEY"] = grant.effect_id
         environment["CDD_EFFECT_FENCE"] = str(grant.fence)
+        if isolated_home is not None:
+            environment["HOME"] = isolated_home
+            environment["TMPDIR"] = isolated_home
+            environment["CODEX_HOME"] = self._environment.get(
+                "CODEX_HOME", str(Path.home() / ".codex")
+            )
         return environment
+
+    @staticmethod
+    def _seatbelt_literal(value: str) -> str:
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    def _seatbelt_command(
+        self,
+        grant: Grant,
+        command: tuple[str, ...],
+        isolated_home: str,
+        read_roots: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if not Path("/usr/bin/sandbox-exec").is_file():
+            self._deny(
+                grant.request_digest,
+                "worker-sandbox-unavailable",
+                "outer worker sandbox is unavailable",
+                grant=grant,
+            )
+        codex_home = self._environment.get("CODEX_HOME") or str(Path.home() / ".codex")
+        literal = self._seatbelt_literal
+        system_reads = (
+            "/System",
+            "/Library",
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/Applications",
+            "/private/etc",
+            "/private/var/select",
+        )
+        approved_reads = tuple(
+            dict.fromkeys((*system_reads, grant.resource, *read_roots))
+        )
+        ancestor_metadata = tuple(
+            dict.fromkeys(
+                str(parent)
+                for root in (grant.resource, isolated_home, *read_roots)
+                for parent in Path(root).parents
+                if str(parent) != "/"
+            )
+        )
+        rules = [
+            "(version 1)",
+            '(import "system.sb")',
+            "(deny file-read*)",
+            "(deny file-write*)",
+            "(deny network*)",
+            "(allow process-exec)",
+            "(allow file-read* "
+            + " ".join(f"(subpath {literal(path)})" for path in approved_reads)
+            + ")",
+            "(allow file-read-metadata "
+            + " ".join(f"(literal {literal(path)})" for path in ancestor_metadata)
+            + ")",
+            f"(allow file-read* file-write* (subpath {literal(isolated_home)}))",
+            (
+                "(allow file-read* file-write* "
+                f"(subpath {literal(codex_home)}) "
+                f"(process-path {literal(grant.executable_realpath)}))"
+            ),
+            (f"(allow network* (process-path {literal(grant.executable_realpath)}))"),
+            (f"(allow mach* ipc* (process-path {literal(grant.executable_realpath)}))"),
+            f"(deny process-exec (literal {literal('/usr/bin/security')}))",
+        ]
+        if grant.capability == "worker.implementation":
+            rules.append(f"(allow file-write* (subpath {literal(grant.resource)}))")
+        return ("/usr/bin/sandbox-exec", "-p", "\n".join(rules), *command)
+
+    @staticmethod
+    def _worker_outcome(completed: subprocess.CompletedProcess[str]) -> DispatchStatus:
+        if completed.returncode != 0:
+            return DispatchStatus.FAILED
+        denied = False
+        failed = False
+        for line in (completed.stdout or "").splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            item = event.get("item") if isinstance(event, dict) else None
+            if not isinstance(item, dict) or item.get("type") != "command_execution":
+                continue
+            if item.get("status") == "in_progress":
+                continue
+            exit_code = item.get("exit_code")
+            if exit_code in (0, None):
+                continue
+            failed = True
+            detail = " ".join(
+                str(item.get(name, "")) for name in ("aggregated_output", "output")
+            )
+            if "Operation not permitted" in detail or "Permission denied" in detail:
+                denied = True
+        if denied:
+            return DispatchStatus.DENIED
+        if failed:
+            return DispatchStatus.FAILED
+        return DispatchStatus.COMPLETED
+
+    @staticmethod
+    def _run_process_tree(
+        argv: tuple[str, ...], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        timeout = float(kwargs.pop("timeout"))
+        stdin_text = kwargs.pop("input", None)
+        kwargs.pop("check", None)
+        if kwargs.pop("capture_output", False):
+            kwargs["stdout"] = subprocess.PIPE
+            kwargs["stderr"] = subprocess.PIPE
+        if stdin_text is not None:
+            kwargs["stdin"] = subprocess.PIPE
+        process = subprocess.Popen(argv, start_new_session=True, **kwargs)
+        try:
+            stdout, stderr = process.communicate(input=stdin_text, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=_TERM_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=_KILL_GRACE_SECONDS)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+            raise subprocess.TimeoutExpired(
+                argv,
+                timeout,
+                output=error.output,
+                stderr=error.stderr,
+            ) from error
+        return subprocess.CompletedProcess(
+            argv,
+            process.returncode,
+            stdout,
+            stderr,
+        )
 
     @staticmethod
     def _evidence_ref(
@@ -772,9 +1206,10 @@ class CapabilityBroker:
         *,
         stdin_text: str | None = None,
         result_validator: ResultValidator | None = None,
+        sandbox_read_roots: tuple[str, ...] = (),
     ) -> tuple[EffectResult, object | None]:
         self._validate_grant(grant)
-        command = self._validate_argv(grant, argv)
+        command, executable_fd, policy_fd = self._validate_argv(grant, argv)
         effect = self.journal.get_effect(grant.run_id, grant.effect_id)
         if effect is None or effect.state is not EffectState.INTENT:
             self._deny(
@@ -797,17 +1232,36 @@ class CapabilityBroker:
             if _is_path_resource(grant.resource) and Path(grant.resource).is_dir()
             else None
         )
+        isolated_home_manager: tempfile.TemporaryDirectory[str] | None = None
+        execution_command = command
+        isolated_home: str | None = None
+        if (
+            self._uses_real_runner
+            and grant.capability.startswith("worker.")
+            and Path(command[0]).name != "limactl"
+        ):
+            isolated_home_manager = tempfile.TemporaryDirectory(
+                prefix="cdd-worker-home-"
+            )
+            isolated_home = isolated_home_manager.name
+            execution_command = self._seatbelt_command(
+                grant,
+                command,
+                isolated_home,
+                sandbox_read_roots,
+            )
         try:
             completed = self._process_runner(
-                command,
+                execution_command,
                 input=stdin_text,
                 cwd=cwd,
-                env=self._child_environment(grant),
+                env=self._child_environment(grant, isolated_home=isolated_home),
                 timeout=grant.timeout_seconds,
                 shell=False,
                 capture_output=True,
                 text=True,
                 check=False,
+                pass_fds=(policy_fd, executable_fd),
             )
         except (subprocess.TimeoutExpired, OSError):
             return (
@@ -822,11 +1276,22 @@ class CapabilityBroker:
                 ),
                 None,
             )
+        finally:
+            os.close(executable_fd)
+            if isolated_home_manager is not None:
+                isolated_home_manager.cleanup()
         stdout = completed.stdout or ""
         stderr = completed.stderr or ""
+        status = (
+            self._worker_outcome(completed)
+            if grant.capability.startswith("worker.")
+            else DispatchStatus.COMPLETED
+            if completed.returncode == 0
+            else DispatchStatus.FAILED
+        )
         validation: object | None = None
         try:
-            if result_validator is not None:
+            if result_validator is not None and status is DispatchStatus.COMPLETED:
                 validation = result_validator(completed)
         except Exception:
             evidence = self._evidence_ref(
@@ -839,13 +1304,26 @@ class CapabilityBroker:
             self.journal.record_effect(
                 grant.effect_id, grant.fence, EffectState.COMPLETED, evidence
             )
+            self._record_decision(
+                BrokerDecision(
+                    grant.request_digest,
+                    False,
+                    "result-policy-violation",
+                    self._clock(),
+                    grant.capability,
+                    grant.resource,
+                    grant.run_id,
+                    grant.run_revision,
+                    self.policy.digest,
+                )
+            )
             raise
         evidence = self._evidence_ref(
             grant,
             returncode=completed.returncode,
             stdout=stdout,
             stderr=stderr,
-            outcome="process-exited",
+            outcome=status.value,
         )
         try:
             self.journal.record_effect(
@@ -866,7 +1344,7 @@ class CapabilityBroker:
             )
         return (
             EffectResult(
-                DispatchStatus.COMPLETED,
+                status,
                 grant.effect_id,
                 grant.fence,
                 completed.returncode,
