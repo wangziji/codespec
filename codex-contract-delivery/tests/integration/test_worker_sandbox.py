@@ -96,9 +96,28 @@ def configured_worker(
     allowed_paths: tuple[str, ...],
     timeout_seconds: int = 120,
     kind: WorkerKind = WorkerKind.IMPLEMENTATION,
+    approved_root: Path | None = None,
+    tracked_files: dict[str, str] | None = None,
 ) -> tuple[WorkerLauncher, WorkerTask, object, CapabilityBroker, Journal]:
-    root = sandbox_base / f"{effect_id}-worktree"
-    initialize_git(root)
+    root = (
+        sandbox_base / f"{effect_id}-worktree"
+        if approved_root is None
+        else approved_root
+    )
+    if approved_root is None:
+        initialize_git(root)
+    if tracked_files:
+        for relative, content in tracked_files.items():
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        subprocess.run(
+            ("git", "-C", str(root), "add", "--", *tracked_files), check=True
+        )
+        subprocess.run(
+            ("git", "-C", str(root), "commit", "-qm", "smoke fixture"),
+            check=True,
+        )
     backend = LimaWorkerBackend(
         LimaWorkerConfig(
             limactl_executable=LIMACTL,
@@ -107,6 +126,7 @@ def configured_worker(
             guest_workspace_root=GUEST_WORKSPACES,
             guest_python=Path("/usr/bin/python3"),
             guest_runner=GUEST_RUNNER,
+            host_staging_root=tmp_path / "broker-stage",
         )
     )
     task = WorkerTask(
@@ -281,6 +301,41 @@ def test_real_lima_worker_isolates_host_and_enforces_export_scope(
     assert allowed.changed_paths == ("allowed.txt",)
     journal.close()
 
+
+def test_real_lima_reads_current_linked_worktree_without_common_git_mount(
+    tmp_path: Path, sandbox_base: Path
+) -> None:
+    """Proves production input is an archive, not the host linked .git file."""
+    common_git = subprocess.run(
+        ("git", "-C", str(CHECKOUT), "rev-parse", "--git-common-dir"),
+        shell=False,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert Path(common_git).resolve().is_relative_to(CHECKOUT) is False
+    launcher, task, grant, _, journal = configured_worker(
+        tmp_path,
+        sandbox_base,
+        "current-linked-root",
+        "Run exactly this shell command, then stop: "
+        "test -f codex-contract-delivery/pyproject.toml && printf LINKED_SNAPSHOT_OK",
+        allowed_paths=(".",),
+        kind=WorkerKind.ANALYSIS,
+        approved_root=CHECKOUT,
+    )
+
+    result = launcher.run(task, grant)
+
+    output = "\n".join(
+        str(event.get("aggregated_output", ""))
+        for event in command_events(result.effect.stdout)
+    )
+    assert result.effect.status is DispatchStatus.COMPLETED, result.effect.stdout
+    assert "LINKED_SNAPSHOT_OK" in output
+    assert result.changed_paths == ()
+    journal.close()
+
     launcher, task, grant, _, journal = configured_worker(
         tmp_path,
         sandbox_base,
@@ -289,18 +344,11 @@ def test_real_lima_worker_isolates_host_and_enforces_export_scope(
         "/bin/sh ./readonly-mount-probe.sh && printf MOUNT_REACHED "
         "|| printf MOUNT_BLOCKED",
         allowed_paths=("approved.txt",),
-    )
-    (task.approved_root / "readonly-mount-probe.sh").write_text(
-        f"#!/bin/sh\nprintf forbidden > {sandbox_base}/readonly-mount-probe\n",
-        encoding="utf-8",
-    )
-    subprocess.run(
-        ("git", "-C", str(task.approved_root), "add", "readonly-mount-probe.sh"),
-        check=True,
-    )
-    subprocess.run(
-        ("git", "-C", str(task.approved_root), "commit", "-qm", "mount probe"),
-        check=True,
+        tracked_files={
+            "readonly-mount-probe.sh": (
+                f"#!/bin/sh\nprintf forbidden > {sandbox_base}/readonly-mount-probe\n"
+            )
+        },
     )
     readonly = launcher.run(task, grant)
     assert not (sandbox_base / "readonly-mount-probe").exists()
@@ -557,9 +605,9 @@ def test_real_lima_timeout_cancels_remote_codex_and_cleans_workspace(
             "-c",
             (
                 "test -e "
-                f"{GUEST_WORKSPACES}/.cdd-control/{effect_id}.cancelled && "
+                f"{GUEST_WORKSPACES}/.cdd-control/{effect_id}.{grant.fence}.cancelled && "
                 "test ! -e "
-                f"{GUEST_WORKSPACES}/.cdd-control/{effect_id}.json && "
+                f"{GUEST_WORKSPACES}/.cdd-control/{effect_id}.{grant.fence}.json && "
                 'test -z "$(find '
                 f"{GUEST_WORKSPACES} -maxdepth 1 -name '{effect_id}-*' -print -quit)\""
             ),

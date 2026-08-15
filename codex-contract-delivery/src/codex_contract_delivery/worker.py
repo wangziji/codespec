@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from hashlib import sha256
@@ -94,13 +95,31 @@ _BROKER_OWNED = ("github", "penpot", "deploy", "secret", "prod")
 class WorkerBackend(Protocol):
     def canonical_command(self, task: WorkerTask) -> tuple[str, ...]: ...
 
-    def apply_export(self, task: WorkerTask, stdout: str) -> tuple[str, ...]: ...
+    def request_payload(self, task: WorkerTask) -> dict[str, str]: ...
+
+    def prepare_export(
+        self,
+        task: WorkerTask,
+        stdout: str,
+        effect_id: str,
+        fence: int,
+    ) -> tuple[str, object]: ...
+
+    def commit_export(
+        self,
+        task: WorkerTask,
+        prepared: object,
+        authority_check: Callable[[], None],
+    ) -> tuple[str, ...]: ...
+
+    def adopt_export(self, prepared: object, fence: int) -> object: ...
 
     def cancel(
         self,
         task: WorkerTask,
         effect_id: str,
         task_fingerprint: str,
+        fence: int,
     ) -> None: ...
 
 
@@ -173,7 +192,8 @@ class WorkerLauncher:
             for item in grant.allowed_write_roots
         ):
             raise WorkerViolation("worker root is outside granted write scope")
-        self._reject_symlinks(root)
+        if self.backend is None:
+            self._reject_symlinks(root)
         return root
 
     @staticmethod
@@ -365,23 +385,7 @@ class WorkerLauncher:
         command = self.build_command(task, grant)
         before = self._snapshot(root)
 
-        def validate_result(
-            completed: subprocess.CompletedProcess[str],
-        ) -> _GitSnapshot:
-            if self.backend is not None:
-                intermediate = self._snapshot(root)
-                if (
-                    self._delta_paths(before, intermediate)
-                    or intermediate.git_metadata_manifest
-                    != before.git_metadata_manifest
-                    or intermediate.submodule_status != before.submodule_status
-                ):
-                    raise WorkerViolation(
-                        "host worktree changed while isolated worker was running"
-                    )
-                exported_paths = self.backend.apply_export(task, completed.stdout or "")
-            else:
-                exported_paths = ()
+        def validated_snapshot(exported_paths: tuple[str, ...]) -> _GitSnapshot:
             after = self._snapshot(root)
             delta_paths = self._delta_paths(before, after)
             self._validate_changed_paths(root, delta_paths)
@@ -413,26 +417,70 @@ class WorkerLauncher:
                 after.submodule_status,
             )
 
-        stdin_text = (
-            json.dumps(
-                {
-                    "schema_version": "1.0",
-                    "approved_context": task.approved_context,
-                    "allowed_paths": list(task.allowed_paths),
-                    "effect_id": grant.effect_id,
-                    "task_fingerprint": task.fingerprint(),
-                },
+        def validate_result(
+            completed: subprocess.CompletedProcess[str],
+        ) -> _GitSnapshot:
+            del completed
+            return validated_snapshot(())
+
+        def prepare_result(
+            completed: subprocess.CompletedProcess[str],
+        ) -> tuple[str, object]:
+            if self.backend is None:
+                raise WorkerViolation("isolated backend is unavailable")
+            intermediate = self._snapshot(root)
+            if (
+                self._delta_paths(before, intermediate)
+                or intermediate.git_metadata_manifest != before.git_metadata_manifest
+                or intermediate.submodule_status != before.submodule_status
+            ):
+                raise WorkerViolation(
+                    "host worktree changed while isolated worker was running"
+                )
+            return self.backend.prepare_export(
+                task,
+                completed.stdout or "",
+                grant.effect_id,
+                grant.fence,
+            )
+
+        def commit_result(
+            prepared: object,
+            authority_check: Callable[[], None],
+        ) -> _GitSnapshot:
+            if self.backend is None:
+                raise WorkerViolation("isolated backend is unavailable")
+            exported_paths = self.backend.commit_export(
+                task,
+                prepared,
+                authority_check,
+            )
+            return validated_snapshot(exported_paths)
+
+        if self.backend is not None:
+            request_record: dict[str, object] = {
+                "schema_version": "1.0",
+                "approved_context": task.approved_context,
+                "allowed_paths": list(task.allowed_paths),
+                "effect_id": grant.effect_id,
+                "fence": grant.fence,
+                "task_fingerprint": task.fingerprint(),
+            }
+            request_record.update(self.backend.request_payload(task))
+            stdin_text = json.dumps(
+                request_record,
                 sort_keys=True,
                 separators=(",", ":"),
             )
-            if self.backend is not None
-            else task.approved_context
-        )
+        else:
+            stdin_text = task.approved_context
         effect, validated = self.broker._dispatch(
             grant,
             command,
             stdin_text=stdin_text,
-            result_validator=validate_result,
+            result_validator=validate_result if self.backend is None else None,
+            result_preparer=prepare_result if self.backend is not None else None,
+            result_committer=commit_result if self.backend is not None else None,
             sandbox_read_roots=()
             if self.backend is not None
             else (
@@ -451,7 +499,12 @@ class WorkerLauncher:
             self.backend is not None
             and effect.status is DispatchStatus.RECONCILIATION_REQUIRED
         ):
-            self.backend.cancel(task, grant.effect_id, task.fingerprint())
+            self.backend.cancel(
+                task,
+                grant.effect_id,
+                task.fingerprint(),
+                grant.fence,
+            )
         after = (
             validated if isinstance(validated, _GitSnapshot) else self._snapshot(root)
         )
@@ -462,4 +515,53 @@ class WorkerLauncher:
             after.diff,
             after.name_status,
             after.changed_paths,
+        )
+
+    def adopt_prepared(
+        self,
+        task: WorkerTask,
+        grant: Grant,
+        prior_stage_ref: str,
+        prepared: object,
+    ) -> WorkerResult:
+        """Commit a reconciled durable stage under a newly authorized fence."""
+        if self.backend is None:
+            raise WorkerViolation("prepared adoption requires an isolated backend")
+        root = self._validate_root(task, grant)
+        self.build_command(task, grant)
+        before = self._snapshot(root)
+        adopted = self.backend.adopt_export(prepared, grant.fence)
+        adopted_ref = getattr(adopted, "stage_ref", None)
+        if not isinstance(adopted_ref, str):
+            raise WorkerViolation("adopted stage has no durable evidence")
+
+        def commit(
+            value: object, authority_check: Callable[[], None]
+        ) -> tuple[str, ...]:
+            return self.backend.commit_export(task, value, authority_check)
+
+        effect, exported = self.broker.commit_prepared_adoption(
+            grant,
+            prior_stage_ref,
+            adopted_ref,
+            adopted,
+            commit,
+        )
+        after = self._snapshot(root)
+        delta_paths = self._delta_paths(before, after)
+        self._validate_changed_paths(root, delta_paths)
+        if after.git_metadata_manifest != before.git_metadata_manifest:
+            raise WorkerViolation("prepared adoption modified protected git metadata")
+        exported_paths = exported if isinstance(exported, tuple) else ()
+        if effect.status is DispatchStatus.COMPLETED and delta_paths != tuple(
+            sorted(exported_paths)
+        ):
+            raise WorkerViolation("prepared adoption delta disagrees with its stage")
+        return WorkerResult(
+            effect,
+            before.diff,
+            before.name_status,
+            after.diff,
+            after.name_status,
+            delta_paths,
         )

@@ -683,25 +683,43 @@ def test_remote_backend_cancels_guest_task_after_host_timeout(tmp_path: Path) ->
 
     class Backend:
         def __init__(self) -> None:
-            self.cancelled: tuple[str, str] | None = None
+            self.cancelled: tuple[str, str, int] | None = None
 
         def canonical_command(self, current: WorkerTask) -> tuple[str, ...]:
             return WorkerLauncher.canonical_command(current, CODEX)
 
-        def apply_export(self, current: WorkerTask, stdout: str) -> tuple[str, ...]:
+        def request_payload(self, current: WorkerTask) -> dict[str, str]:
+            return {}
+
+        def prepare_export(
+            self,
+            current: WorkerTask,
+            stdout: str,
+            effect_id: str,
+            fence: int,
+        ) -> tuple[str, object]:
             raise AssertionError("timeout must never import an export")
+
+        def commit_export(
+            self,
+            current: WorkerTask,
+            prepared: object,
+            authority_check: object,
+        ) -> tuple[str, ...]:
+            raise AssertionError("timeout must never commit an export")
 
         def cancel(
             self,
             current: WorkerTask,
             effect_id: str,
             task_fingerprint: str,
+            fence: int,
         ) -> None:
-            self.cancelled = (effect_id, task_fingerprint)
+            self.cancelled = (effect_id, task_fingerprint, fence)
 
     backend = Backend()
     result = WorkerLauncher(broker, backend=backend).run(task, grant)
 
     assert result.effect.status is DispatchStatus.RECONCILIATION_REQUIRED
-    assert backend.cancelled == (grant.effect_id, task.fingerprint())
+    assert backend.cancelled == (grant.effect_id, task.fingerprint(), grant.fence)
     journal.close()

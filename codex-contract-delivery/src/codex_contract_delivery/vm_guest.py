@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
+import errno
+import io
 import json
 import os
 import re
@@ -12,6 +15,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from dataclasses import dataclass
@@ -29,13 +33,18 @@ _TERM_GRACE_SECONDS = 1.0
 _KILL_GRACE_SECONDS = 1.0
 _PINNED_CODEX_VERSION = "0.147.0"
 _GUEST_CODEX_HOME = Path("/home/mark.guest/.codex")
+_MAX_REQUEST_BYTES = 32 * 1024 * 1024
+_MAX_SNAPSHOT_BYTES = 24 * 1024 * 1024
 _REQUEST_FIELDS = frozenset(
     {
         "schema_version",
         "approved_context",
         "allowed_paths",
         "effect_id",
+        "fence",
         "task_fingerprint",
+        "source_snapshot_sha256",
+        "source_snapshot_b64",
     }
 )
 
@@ -45,7 +54,10 @@ class GuestRequest:
     approved_context: str
     allowed_paths: tuple[str, ...]
     effect_id: str
+    fence: int
     task_fingerprint: str
+    source_snapshot_sha256: str
+    source_snapshot: bytes
 
 
 def check_sandbox_prerequisites(
@@ -96,12 +108,104 @@ def check_sandbox_prerequisites(
         raise RuntimeError("bubblewrap AppArmor functional probe failed")
 
 
+def _runtime_file_identity(path: Path) -> dict[str, object]:
+    resolved = path.resolve(strict=True)
+    descriptor = os.open(
+        resolved,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode):
+            raise RuntimeError("guest runtime identity is not regular")
+        digest = sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        return {
+            "path": str(resolved),
+            "device": details.st_dev,
+            "inode": details.st_ino,
+            "mode": details.st_mode,
+            "size": details.st_size,
+            "mtime_ns": details.st_mtime_ns,
+            "sha256": digest.hexdigest(),
+        }
+    finally:
+        os.close(descriptor)
+
+
+def runtime_attestation(
+    *,
+    codex_executable: Path = Path("/usr/local/bin/codex"),
+    runner: Path | None = None,
+) -> dict[str, object]:
+    """Prove the fixed guest runner/runtime and its read-only source mount."""
+    runner_path = Path(__file__) if runner is None else runner
+    runner_real = runner_path.resolve(strict=True)
+    mount_options: set[str] | None = None
+    selected_mount: Path | None = None
+    longest = -1
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise RuntimeError("guest mount authority is unavailable") from error
+    for line in lines:
+        fields = line.split(" ")
+        if len(fields) < 10 or "-" not in fields:
+            continue
+        mount_point = Path(fields[4].replace("\\040", " "))
+        try:
+            runner_real.relative_to(mount_point)
+        except ValueError:
+            continue
+        if len(str(mount_point)) > longest:
+            longest = len(str(mount_point))
+            mount_options = set(fields[5].split(","))
+            selected_mount = mount_point
+    if mount_options is None or selected_mount is None:
+        raise RuntimeError("guest runner mount authority is unavailable")
+    if "ro" not in mount_options:
+        probe = selected_mount / f".cdd-ro-attest-{os.getuid()}-{os.getpid()}"
+        try:
+            descriptor = os.open(
+                probe,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+        except OSError as error:
+            if error.errno not in {errno.EACCES, errno.EPERM, errno.EROFS}:
+                raise RuntimeError(
+                    "guest runner mount probe failed ambiguously"
+                ) from error
+        else:
+            os.close(descriptor)
+            probe.unlink(missing_ok=True)
+            raise RuntimeError("guest runner mount is writable")
+    check_sandbox_prerequisites()
+    environment = {
+        name: os.environ[name]
+        for name in ("HOME", "PATH", "LANG", "LC_ALL", "CODEX_HOME")
+        if name in os.environ
+    }
+    validate_codex_version(codex_executable, environment)
+    return {
+        "type": "cdd.vm.attestation",
+        "schema_version": "1.0",
+        "runner": _runtime_file_identity(runner_real),
+        "python": _runtime_file_identity(Path(sys.executable)),
+        "codex": _runtime_file_identity(codex_executable),
+        "codex_version": _PINNED_CODEX_VERSION,
+        "runner_mount_readonly": True,
+        "sandbox_prerequisites": True,
+    }
+
+
 def execute_guest(
     *,
-    source_root: Path,
     workspace_base: Path,
     kind: str,
     expected_fingerprint: str,
+    expected_snapshot_digest: str,
     codex_executable: Path,
     request_text: str,
     guest_codex_home: Path = _GUEST_CODEX_HOME,
@@ -112,15 +216,16 @@ def execute_guest(
     )
     if kind not in {"analysis", "implementation"}:
         raise ValueError("unknown worker kind")
-    source = source_root.resolve(strict=True)
     base = workspace_base.resolve(strict=True)
+    if Path(os.path.abspath(workspace_base)) != base:
+        raise ValueError("workspace base cannot be a symlink")
+    if not base.is_dir():
+        raise ValueError("workspace base must be a directory")
     if (
-        Path(os.path.abspath(source_root)) != source
-        or Path(os.path.abspath(workspace_base)) != base
+        _DIGEST.fullmatch(expected_snapshot_digest) is None
+        or request.source_snapshot_sha256 != expected_snapshot_digest
     ):
-        raise ValueError("source and workspace base cannot be symlinks")
-    if not source.is_dir() or not base.is_dir():
-        raise ValueError("source and workspace base must be directories")
+        raise ValueError("source snapshot digest drifted")
     environment = {
         name: os.environ[name]
         for name in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "CODEX_HOME")
@@ -129,13 +234,17 @@ def execute_guest(
     codex_home = _codex_home(environment, expected=guest_codex_home)
     environment["CODEX_HOME"] = str(codex_home)
     validate_codex_version(codex_executable, environment)
-    control_dir, state_path, cancelled_path = _control_paths(base, request.effect_id)
+    control_dir, state_path, cancelled_path = _control_paths(
+        base, request.effect_id, request.fence
+    )
     _ensure_control_dir(control_dir)
     if cancelled_path.exists():
         raise RuntimeError("guest task was already cancelled")
     workspace = Path(
         tempfile.mkdtemp(
-            prefix=f"{request.effect_id}-{request.task_fingerprint[:16]}-",
+            prefix=(
+                f"{request.effect_id}-{request.fence}-{request.task_fingerprint[:16]}-"
+            ),
             dir=base,
         )
     ).resolve(strict=True)
@@ -147,7 +256,7 @@ def execute_guest(
             workspace,
             process_group=None,
         )
-        _copy_tracked_source(source, workspace)
+        _extract_source_snapshot(request.source_snapshot, workspace)
         _git(workspace, "init", "-q")
         _git(workspace, "config", "user.email", "worker@cdd.invalid")
         _git(workspace, "config", "user.name", "CDD Isolated Worker")
@@ -214,11 +323,17 @@ def execute_guest(
             pass
 
 
-def _control_paths(base: Path, effect_id: str) -> tuple[Path, Path, Path]:
+def _control_paths(base: Path, effect_id: str, fence: int) -> tuple[Path, Path, Path]:
     if _IDENTIFIER.fullmatch(effect_id) is None:
         raise ValueError("effect id is invalid")
+    if not isinstance(fence, int) or isinstance(fence, bool) or fence <= 0:
+        raise ValueError("effect fence is invalid")
     control = base / ".cdd-control"
-    return control, control / f"{effect_id}.json", control / f"{effect_id}.cancelled"
+    return (
+        control,
+        control / f"{effect_id}.{fence}.json",
+        control / f"{effect_id}.{fence}.cancelled",
+    )
 
 
 def _ensure_control_dir(control: Path) -> None:
@@ -281,16 +396,21 @@ def cancel_guest_task(
     workspace_base: Path,
     effect_id: str,
     task_fingerprint: str,
+    fence: int,
 ) -> None:
     if _DIGEST.fullmatch(task_fingerprint) is None:
         raise ValueError("task fingerprint is invalid")
     base = workspace_base.resolve(strict=True)
     if Path(os.path.abspath(workspace_base)) != base:
         raise ValueError("workspace base cannot be a symlink")
-    control_dir, state_path, cancelled_path = _control_paths(base, effect_id)
+    control_dir, state_path, cancelled_path = _control_paths(base, effect_id, fence)
     _ensure_control_dir(control_dir)
     marker = json.dumps(
-        {"schema_version": "1.0", "task_fingerprint": task_fingerprint},
+        {
+            "schema_version": "1.0",
+            "task_fingerprint": task_fingerprint,
+            "fence": fence,
+        },
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -343,7 +463,7 @@ def cancel_guest_task(
         raise TypeError("guest cancellation workspace is malformed")
     workspace = Path(workspace_value)
     if not workspace.is_relative_to(base) or not workspace.name.startswith(
-        f"{effect_id}-{task_fingerprint[:16]}-"
+        f"{effect_id}-{fence}-{task_fingerprint[:16]}-"
     ):
         raise RuntimeError("guest cancellation workspace escapes its task")
     process_group = record.get("process_group")
@@ -359,55 +479,58 @@ def cancel_guest_task(
         state_path.unlink(missing_ok=True)
 
 
-def _copy_tracked_source(source: Path, workspace: Path) -> None:
-    completed = subprocess.run(
-        ("git", "-C", str(source), "ls-files", "--cached", "--stage", "-z"),
-        shell=False,
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError("approved source must expose tracked git files")
-    for raw_entry in completed.stdout.split(b"\x00"):
-        if not raw_entry:
-            continue
-        try:
-            metadata, raw_path = raw_entry.split(b"\t", 1)
-            mode, _object_id, stage = metadata.decode("ascii").split(" ")
-            relative = raw_path.decode("utf-8")
-        except (UnicodeDecodeError, ValueError) as error:
-            raise RuntimeError("tracked source manifest is malformed") from error
-        candidate = Path(relative)
+def _extract_source_snapshot(snapshot: bytes, workspace: Path) -> None:
+    """Materialize only the regular, controller-attested archive subset."""
+    seen: set[str] = set()
+    try:
+        with tarfile.open(fileobj=io.BytesIO(snapshot), mode="r:") as archive:
+            _extract_snapshot_members(archive, workspace, seen)
+    except tarfile.TarError as error:
+        raise RuntimeError("source snapshot archive is malformed") from error
+
+
+def _extract_snapshot_members(
+    archive: tarfile.TarFile, workspace: Path, seen: set[str]
+) -> None:
+    for member in archive:
+        candidate = Path(member.name)
         if (
-            mode not in {"100644", "100755"}
-            or stage != "0"
+            not member.isfile()
+            or member.name in seen
+            or not member.name
             or candidate.is_absolute()
             or ".." in candidate.parts
-            or not relative
+            or candidate.parts[0] == ".codex"
+            or candidate.name == ".mcp.json"
+            or member.mode not in {0o644, 0o755}
+            or member.pax_headers
         ):
-            raise RuntimeError("tracked source contains an unsupported entry")
-        if candidate.parts[0] == ".codex" or candidate.name == ".mcp.json":
-            raise RuntimeError("tracked source contains Codex control configuration")
-        source_file = source / candidate
-        try:
-            details = source_file.lstat()
-            resolved = source_file.resolve(strict=True)
-        except OSError as error:
-            raise RuntimeError("tracked source file is unavailable") from error
-        if not stat.S_ISREG(details.st_mode) or not resolved.is_relative_to(source):
-            raise RuntimeError("tracked source contains a symlink or path escape")
+            raise RuntimeError("source snapshot contains an unsupported entry")
+        seen.add(member.name)
         destination = workspace / candidate
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_file, destination, follow_symlinks=False)
+        destination.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        if destination.parent.resolve(strict=True).is_relative_to(workspace) is False:
+            raise RuntimeError("source snapshot path escapes the workspace")
+        source = archive.extractfile(member)
+        if source is None:
+            raise RuntimeError("source snapshot entry is unavailable")
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            member.mode,
+        )
         try:
-            copied_details = destination.lstat()
-            copied_path = destination.resolve(strict=True)
-        except OSError as error:
-            raise RuntimeError("tracked source copy is unavailable") from error
-        if not stat.S_ISREG(copied_details.st_mode) or not copied_path.is_relative_to(
-            workspace
-        ):
-            raise RuntimeError("tracked source copy contains a symlink or path escape")
+            remaining = member.size
+            while remaining:
+                chunk = source.read(min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise RuntimeError("source snapshot entry is truncated")
+                os.write(descriptor, chunk)
+                remaining -= len(chunk)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+            source.close()
 
 
 def _git(root: Path, *arguments: str) -> None:
@@ -435,18 +558,36 @@ def _git_bytes(root: Path, *arguments: str) -> bytes:
 
 def main(argv: list[str] | None = None) -> int:
     values = list(sys.argv[1:] if argv is None else argv)
+    if "--attest" in values:
+        parser = argparse.ArgumentParser(prog="cdd-vm-guest-attest")
+        parser.add_argument("--attest", action="store_true", required=True)
+        parser.add_argument("--json", action="store_true", required=True)
+        parser.parse_args(values)
+        try:
+            record = runtime_attestation()
+        except (OSError, RuntimeError, ValueError) as error:
+            sys.stderr.write(f"CDD guest attestation failed closed: {error}\n")
+            return 70
+        sys.stdout.write(json.dumps(record, sort_keys=True, separators=(",", ":")))
+        sys.stdout.write("\n")
+        return 0
     if "--cancel-effect" in values:
         parser = argparse.ArgumentParser(prog="cdd-vm-guest-cancel")
         parser.add_argument("--workspace-base", type=Path, required=True)
+        parser.add_argument("--authority-digest", required=True)
         parser.add_argument("--cancel-effect", required=True)
         parser.add_argument("--cancel-task-fingerprint", required=True)
+        parser.add_argument("--cancel-fence", type=int, required=True)
         parser.add_argument("--json", action="store_true", required=True)
         arguments = parser.parse_args(values)
         try:
+            if _DIGEST.fullmatch(arguments.authority_digest) is None:
+                raise ValueError("worker authority digest is invalid")
             cancel_guest_task(
                 arguments.workspace_base,
                 arguments.cancel_effect,
                 arguments.cancel_task_fingerprint,
+                arguments.cancel_fence,
             )
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             sys.stderr.write(f"CDD guest cancellation failed closed: {error}\n")
@@ -455,21 +596,24 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     parser = argparse.ArgumentParser(prog="cdd-vm-guest")
     parser.add_argument("--workspace-base", type=Path, required=True)
-    parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument("--authority-digest", required=True)
+    parser.add_argument("--source-snapshot-digest", required=True)
     parser.add_argument("--kind", choices=("analysis", "implementation"), required=True)
     parser.add_argument("--task-fingerprint", required=True)
     parser.add_argument("--json", action="store_true", required=True)
     arguments = parser.parse_args(values)
-    request_text = sys.stdin.read(1_000_001)
-    if len(request_text) > 1_000_000:
-        parser.error("worker request exceeds one megabyte")
+    if _DIGEST.fullmatch(arguments.authority_digest) is None:
+        parser.error("worker authority digest is invalid")
+    request_text = sys.stdin.read(_MAX_REQUEST_BYTES + 1)
+    if len(request_text) > _MAX_REQUEST_BYTES:
+        parser.error("worker request exceeds the bounded snapshot envelope")
     try:
         check_sandbox_prerequisites()
         completed = execute_guest(
-            source_root=arguments.source_root,
             workspace_base=arguments.workspace_base,
             kind=arguments.kind,
             expected_fingerprint=arguments.task_fingerprint,
+            expected_snapshot_digest=arguments.source_snapshot_digest,
             codex_executable=Path("/usr/local/bin/codex"),
             request_text=request_text,
         )
@@ -589,6 +733,9 @@ def parse_request(value: str, *, expected_fingerprint: str) -> GuestRequest:
     effect_id = record["effect_id"]
     if not isinstance(effect_id, str) or _IDENTIFIER.fullmatch(effect_id) is None:
         raise ValueError("effect id is invalid")
+    fence = record["fence"]
+    if not isinstance(fence, int) or isinstance(fence, bool) or fence <= 0:
+        raise ValueError("effect fence is invalid")
     fingerprint = record["task_fingerprint"]
     if (
         not isinstance(fingerprint, str)
@@ -596,6 +743,24 @@ def parse_request(value: str, *, expected_fingerprint: str) -> GuestRequest:
         or fingerprint != expected_fingerprint
     ):
         raise ValueError("task fingerprint drifted")
+    snapshot_digest = record["source_snapshot_sha256"]
+    encoded_snapshot = record["source_snapshot_b64"]
+    if (
+        not isinstance(snapshot_digest, str)
+        or _DIGEST.fullmatch(snapshot_digest) is None
+    ):
+        raise ValueError("source snapshot digest is invalid")
+    if not isinstance(encoded_snapshot, str):
+        raise TypeError("source snapshot payload is invalid")
+    try:
+        snapshot = base64.b64decode(encoded_snapshot, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("source snapshot payload is invalid") from error
+    if (
+        len(snapshot) > _MAX_SNAPSHOT_BYTES
+        or sha256(snapshot).hexdigest() != snapshot_digest
+    ):
+        raise ValueError("source snapshot payload drifted")
     raw_paths = record["allowed_paths"]
     if not isinstance(raw_paths, list) or not raw_paths:
         raise ValueError("allowed paths must be a non-empty list")
@@ -610,7 +775,15 @@ def parse_request(value: str, *, expected_fingerprint: str) -> GuestRequest:
         if normalized in paths:
             raise ValueError("allowed paths contain a duplicate")
         paths.append(normalized)
-    return GuestRequest(context, tuple(paths), effect_id, fingerprint)
+    return GuestRequest(
+        context,
+        tuple(paths),
+        effect_id,
+        fence,
+        fingerprint,
+        snapshot_digest,
+        snapshot,
+    )
 
 
 if __name__ == "__main__":

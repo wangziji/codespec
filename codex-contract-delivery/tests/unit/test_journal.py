@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import codex_contract_delivery.journal as journal_module
 import pytest
+
+import codex_contract_delivery.journal as journal_module
 from codex_contract_delivery.journal import (
     ClockRollback,
     DatabaseBusy,
@@ -28,7 +29,7 @@ from codex_contract_delivery.state_machine import InvalidTransition, RunEvent, R
 
 class MutableClock:
     def __init__(self) -> None:
-        self.now = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+        self.now = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
 
     def __call__(self) -> datetime:
         return self.now
@@ -39,7 +40,7 @@ class MutableClock:
 
 class AdvancingClock:
     def __init__(self) -> None:
-        self.now = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+        self.now = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
         self.calls = 0
 
     def __call__(self) -> datetime:
@@ -335,12 +336,12 @@ def test_open_is_repeatable_and_enables_sqlite_safety_pragmas(
             )
         }
         assert {"runs", "effects", "leases", "events"} <= tables
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert (
             connection.execute(
                 "SELECT schema_version FROM journal_metadata WHERE singleton = 1"
             ).fetchone()[0]
-            == 2
+            == 3
         )
     finally:
         connection.close()
@@ -372,12 +373,12 @@ def test_open_migrates_real_ba17dca_schema_and_preserves_data(
 
     connection = sqlite3.connect(journal_path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert (
             connection.execute(
                 "SELECT schema_version FROM journal_metadata WHERE singleton = 1"
             ).fetchone()[0]
-            == 2
+            == 3
         )
         assert dict(connection.execute("SELECT effect_id, fence FROM leases")) == {
             "started-effect": 7,
@@ -401,12 +402,12 @@ def test_open_migrates_clean_round2_v1_and_preserves_audit_identity(
 
     connection = sqlite3.connect(journal_path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert (
             connection.execute(
                 "SELECT schema_version FROM journal_metadata WHERE singleton = 1"
             ).fetchone()[0]
-            == 2
+            == 3
         )
         assert connection.execute(
             "SELECT reconciliation_id, effect_id, fence, outcome, evidence_ref "
@@ -438,6 +439,45 @@ def test_open_migrates_clean_round2_v1_and_preserves_audit_identity(
 
     reopened = Journal.open(journal_path)
     reopened.close()
+
+
+def test_open_migrates_exact_v2_manifest_to_v3_prepared_state(
+    journal_path: Path,
+) -> None:
+    """Would fail if the deployed v2 manifest could not reach PREPARED safely."""
+    connection = sqlite3.connect(journal_path)
+    try:
+        connection.executescript(journal_module._V2_SCHEMA)
+        connection.execute("PRAGMA user_version = 2")
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = Journal.open(journal_path)
+    try:
+        seed_effect(migrated)
+        lease = migrated.acquire_attempt(
+            "run-1", "deploy-1", "worker-a", timedelta(seconds=30)
+        )
+        stage = "effect-stage://sha256/" + "a" * 64
+        migrated.record_effect("deploy-1", lease.fence, EffectState.STARTED, None)
+        migrated.record_effect("deploy-1", lease.fence, EffectState.PREPARED, stage)
+        effect = migrated.get_effect("run-1", "deploy-1")
+        assert effect is not None and effect.evidence_ref == stage
+    finally:
+        migrated.close()
+
+    connection = sqlite3.connect(journal_path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert (
+            connection.execute(
+                "SELECT schema_version FROM journal_metadata WHERE singleton = 1"
+            ).fetchone()[0]
+            == 3
+        )
+    finally:
+        connection.close()
 
 
 def test_open_rejects_partial_unversioned_ddl_without_modifying_it(
@@ -1464,7 +1504,75 @@ def test_locked_database_raises_stable_domain_error(
     finally:
         blocker.rollback()
         blocker.close()
-        journal.close()
+    journal.close()
+
+
+def test_prepared_effect_durably_authorizes_commit_before_completion(
+    tmp_path: Path,
+) -> None:
+    """Would fail if a host mutation had no durable write-ahead authorization."""
+    journal = Journal.open(tmp_path / "prepared.sqlite3")
+    seed_effect(journal)
+    lease = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(seconds=30)
+    )
+    stage_ref = "effect-stage://sha256/" + "a" * 64
+
+    journal.record_effect("deploy-1", lease.fence, EffectState.STARTED, None)
+    journal.record_effect("deploy-1", lease.fence, "prepared", stage_ref)
+
+    prepared = journal.get_effect("run-1", "deploy-1")
+    assert prepared is not None
+    assert prepared.state.value == "prepared"
+    assert prepared.evidence_ref == stage_ref
+    assert not journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(seconds=30)
+    ).dispatch_allowed
+
+    journal.record_effect("deploy-1", lease.fence, EffectState.COMPLETED, stage_ref)
+    completed = journal.get_effect("run-1", "deploy-1")
+    assert completed is not None
+    assert completed.state is EffectState.COMPLETED
+    assert completed.evidence_ref == stage_ref
+    journal.close()
+
+
+def test_prepared_stage_can_only_be_adopted_by_new_live_fence(
+    tmp_path: Path, clock: MutableClock
+) -> None:
+    """Would fail if an expired fence could apply or a retry lost its stage."""
+    journal = Journal.open(tmp_path / "adopt.sqlite3", clock=clock)
+    seed_effect(journal)
+    first = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(seconds=1)
+    )
+    prior = "effect-stage://sha256/" + "a" * 64
+    adopted = "effect-stage://sha256/" + "b" * 64
+    journal.record_effect("deploy-1", first.fence, EffectState.STARTED, None)
+    journal.record_effect("deploy-1", first.fence, EffectState.PREPARED, prior)
+    journal.record_reconciliation(
+        "deploy-1",
+        first.fence,
+        ReconciliationOutcome.OBSERVED_ABSENT,
+        "probe://host-before-manifest",
+    )
+    clock.advance(timedelta(seconds=2))
+    second = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(seconds=30)
+    )
+
+    assert second.fence > first.fence
+    assert second.dispatch_allowed is False
+    with pytest.raises(StaleFence):
+        journal.adopt_prepared("deploy-1", first.fence, prior, adopted)
+
+    journal.adopt_prepared("deploy-1", second.fence, prior, adopted)
+    effect = journal.get_effect("run-1", "deploy-1")
+    assert effect is not None
+    assert effect.state is EffectState.PREPARED
+    assert effect.evidence_ref == adopted
+    journal.record_effect("deploy-1", second.fence, EffectState.COMPLETED, adopted)
+    journal.close()
 
 
 def test_invalid_run_transition_does_not_append_event(journal: Journal) -> None:

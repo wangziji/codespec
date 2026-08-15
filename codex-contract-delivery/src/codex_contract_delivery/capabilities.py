@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import stat
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -606,6 +608,42 @@ class CapabilityBroker:
         self._audit_sink = audit_sink
         self._issued: dict[str, Grant] = {}
         self._decisions: list[BrokerDecision] = []
+        self._executable_directory = tempfile.TemporaryDirectory(
+            prefix="cdd-verified-executables-"
+        )
+        executable_root = Path(self._executable_directory.name)
+        executable_root.chmod(0o700)
+        trusted: dict[str, str] = {}
+        materialized_by_digest: dict[str, str] = {}
+        for rule in self.policy.rules:
+            digest = rule.executable_identity.content_sha256
+            materialized = materialized_by_digest.get(digest)
+            if materialized is None:
+                target = executable_root / digest
+                shutil.copyfile(
+                    rule.allowed_argv_prefix[0],
+                    target,
+                    follow_symlinks=False,
+                )
+                copied = target.lstat()
+                if not stat.S_ISREG(copied.st_mode) or target.is_symlink():
+                    raise PolicyInvalid("verified executable copy is not regular")
+                target.chmod(0o500)
+                descriptor, copied_identity = _open_executable(str(target))
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                if (
+                    copied_identity.size != rule.executable_identity.size
+                    or copied_identity.content_sha256 != digest
+                ):
+                    raise PolicyInvalid("verified executable copy failed attestation")
+                materialized = str(target)
+                materialized_by_digest[digest] = materialized
+            trusted[rule.policy_id] = materialized
+        executable_root.chmod(0o500)
+        self._trusted_executables = MappingProxyType(trusted)
 
     @property
     def decisions(self) -> tuple[BrokerDecision, ...]:
@@ -658,6 +696,41 @@ class CapabilityBroker:
         raise CapabilityDenied(message)
 
     def authorize(self, request: CapabilityRequest, context: RunContext) -> Grant:
+        return self._authorize(request, context, prepared_adoption_ref=None)
+
+    def authorize_prepared_adoption(
+        self,
+        request: CapabilityRequest,
+        context: RunContext,
+        prepared_adoption_ref: str,
+    ) -> Grant:
+        if (
+            not isinstance(prepared_adoption_ref, str)
+            or re.fullmatch(
+                r"effect-stage://sha256/[a-f0-9]{64}", prepared_adoption_ref
+            )
+            is None
+        ):
+            self._deny(
+                canonical_digest(request.canonical_record()),
+                "prepared-adoption-evidence",
+                "prepared adoption evidence is invalid",
+                request=request,
+                context=context,
+            )
+        return self._authorize(
+            request,
+            context,
+            prepared_adoption_ref=prepared_adoption_ref,
+        )
+
+    def _authorize(
+        self,
+        request: CapabilityRequest,
+        context: RunContext,
+        *,
+        prepared_adoption_ref: str | None,
+    ) -> Grant:
         request_digest = canonical_digest(request.canonical_record())
 
         def deny(code: str, message: str) -> None:
@@ -757,7 +830,20 @@ class CapabilityBroker:
                 context.worker_id,
                 timedelta(seconds=lease_ttl),
             )
-            lease.assert_dispatch_allowed()
+            if prepared_adoption_ref is None:
+                lease.assert_dispatch_allowed()
+            else:
+                effect = self.journal.get_effect(context.run_id, context.effect_id)
+                if (
+                    lease.dispatch_allowed
+                    or effect is None
+                    or effect.state is not EffectState.PREPARED
+                    or effect.evidence_ref != prepared_adoption_ref
+                ):
+                    deny(
+                        "prepared-adoption-mismatch",
+                        "prepared adoption does not match durable stage authority",
+                    )
         except ReconciliationRequired:
             deny(
                 "reconciliation-required",
@@ -806,7 +892,9 @@ class CapabilityBroker:
             BrokerDecision(
                 request_digest,
                 True,
-                "authorized",
+                "prepared-adoption-authorized"
+                if prepared_adoption_ref is not None
+                else "authorized",
                 issued_at,
                 request.capability,
                 request.resource,
@@ -948,16 +1036,26 @@ class CapabilityBroker:
                 and prefix[6] == "--workspace-base"
                 and Path(prefix[7]).is_absolute()
             ):
-                expected = (
-                    *prefix,
-                    "--source-root",
-                    resource,
-                    "--kind",
-                    "analysis" if mode == "read-only" else "implementation",
-                    "--task-fingerprint",
-                    request.task_fingerprint,
-                    "--json",
-                )
+                suffix = materialized[len(prefix) :]
+                if (
+                    len(suffix) != 9
+                    or suffix[0] != "--authority-digest"
+                    or _DIGEST.fullmatch(suffix[1]) is None
+                    or suffix[2] != "--source-snapshot-digest"
+                    or _DIGEST.fullmatch(suffix[3]) is None
+                    or suffix[4] != "--kind"
+                    or suffix[5]
+                    != ("analysis" if mode == "read-only" else "implementation")
+                    or suffix[6] != "--task-fingerprint"
+                    or suffix[7] != request.task_fingerprint
+                    or suffix[8] != "--json"
+                ):
+                    self._deny(
+                        request_digest,
+                        "worker-command-grammar",
+                        "worker command does not match canonical argv grammar",
+                    )
+                expected = materialized
             else:
                 expected = (
                     prefix[0],
@@ -1070,6 +1168,7 @@ class CapabilityBroker:
         approved_reads = tuple(
             dict.fromkeys((*system_reads, grant.resource, *read_roots))
         )
+        trusted_executable = command[0]
         ancestor_metadata = tuple(
             dict.fromkeys(
                 str(parent)
@@ -1095,10 +1194,10 @@ class CapabilityBroker:
             (
                 "(allow file-read* file-write* "
                 f"(subpath {literal(codex_home)}) "
-                f"(process-path {literal(grant.executable_realpath)}))"
+                f"(process-path {literal(trusted_executable)}))"
             ),
-            (f"(allow network* (process-path {literal(grant.executable_realpath)}))"),
-            (f"(allow mach* ipc* (process-path {literal(grant.executable_realpath)}))"),
+            (f"(allow network* (process-path {literal(trusted_executable)}))"),
+            (f"(allow mach* ipc* (process-path {literal(trusted_executable)}))"),
             f"(deny process-exec (literal {literal('/usr/bin/security')}))",
         ]
         if grant.capability == "worker.implementation":
@@ -1152,11 +1251,33 @@ class CapabilityBroker:
         try:
             stdout, stderr = process.communicate(input=stdin_text, timeout=timeout)
         except subprocess.TimeoutExpired as error:
-            os.killpg(process.pid, signal.SIGTERM)
+            process_group = process.pid
+
+            def group_exists() -> bool:
+                try:
+                    os.killpg(process_group, 0)
+                except ProcessLookupError:
+                    return False
+                return True
+
             try:
-                process.wait(timeout=_TERM_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                os.killpg(process_group, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            term_deadline = time.monotonic() + _TERM_GRACE_SECONDS
+            while group_exists() and time.monotonic() < term_deadline:
+                process.poll()
+                time.sleep(0.01)
+            if group_exists():
+                try:
+                    os.killpg(process_group, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            kill_deadline = time.monotonic() + _KILL_GRACE_SECONDS
+            while group_exists() and time.monotonic() < kill_deadline:
+                process.poll()
+                time.sleep(0.01)
+            if process.poll() is None:
                 process.wait(timeout=_KILL_GRACE_SECONDS)
             for stream in (process.stdin, process.stdout, process.stderr):
                 if stream is not None:
@@ -1199,6 +1320,80 @@ class CapabilityBroker:
         result, _ = self._dispatch(grant, argv)
         return result
 
+    def commit_prepared_adoption(
+        self,
+        grant: Grant,
+        prior_stage_ref: str,
+        adopted_stage_ref: str,
+        prepared: object,
+        committer: Callable[[object, Callable[[], None]], object],
+    ) -> tuple[EffectResult, object | None]:
+        """Adopt and commit a staged result without re-running the worker."""
+        self._validate_grant(grant)
+        try:
+            self.journal.adopt_prepared(
+                grant.effect_id,
+                grant.fence,
+                prior_stage_ref,
+                adopted_stage_ref,
+            )
+        except JournalError:
+            return (
+                EffectResult(
+                    DispatchStatus.RECONCILIATION_REQUIRED,
+                    grant.effect_id,
+                    grant.fence,
+                    None,
+                    "",
+                    "",
+                    None,
+                ),
+                None,
+            )
+
+        def validate_commit_authority() -> None:
+            self._validate_grant(grant)
+            self.journal.record_effect(
+                grant.effect_id,
+                grant.fence,
+                EffectState.PREPARED,
+                adopted_stage_ref,
+            )
+
+        try:
+            validation = committer(prepared, validate_commit_authority)
+            self.journal.record_effect(
+                grant.effect_id,
+                grant.fence,
+                EffectState.COMPLETED,
+                adopted_stage_ref,
+            )
+        except Exception:  # noqa: BLE001 - adoption remains typed reconciliation
+            return (
+                EffectResult(
+                    DispatchStatus.RECONCILIATION_REQUIRED,
+                    grant.effect_id,
+                    grant.fence,
+                    None,
+                    "",
+                    "",
+                    None,
+                ),
+                None,
+            )
+        return (
+            EffectResult(
+                DispatchStatus.COMPLETED,
+                grant.effect_id,
+                grant.fence,
+                0,
+                "",
+                "",
+                adopted_stage_ref,
+            ),
+            validation,
+        )
+
     def _dispatch(
         self,
         grant: Grant,
@@ -1206,6 +1401,11 @@ class CapabilityBroker:
         *,
         stdin_text: str | None = None,
         result_validator: ResultValidator | None = None,
+        result_preparer: Callable[
+            [subprocess.CompletedProcess[str]], tuple[str, object]
+        ]
+        | None = None,
+        result_committer: Callable[[object, Callable[[], None]], object] | None = None,
         sandbox_read_roots: tuple[str, ...] = (),
     ) -> tuple[EffectResult, object | None]:
         self._validate_grant(grant)
@@ -1233,7 +1433,10 @@ class CapabilityBroker:
             else None
         )
         isolated_home_manager: tempfile.TemporaryDirectory[str] | None = None
-        execution_command = command
+        execution_command = (
+            self._trusted_executables[grant.policy_id],
+            *command[1:],
+        )
         isolated_home: str | None = None
         if (
             self._uses_real_runner
@@ -1246,7 +1449,7 @@ class CapabilityBroker:
             isolated_home = isolated_home_manager.name
             execution_command = self._seatbelt_command(
                 grant,
-                command,
+                execution_command,
                 isolated_home,
                 sandbox_read_roots,
             )
@@ -1290,8 +1493,16 @@ class CapabilityBroker:
             else DispatchStatus.FAILED
         )
         validation: object | None = None
+        prepared: object | None = None
+        prepared_ref: str | None = None
         try:
-            if result_validator is not None and status is DispatchStatus.COMPLETED:
+            if result_preparer is not None and status is DispatchStatus.COMPLETED:
+                if result_committer is None:
+                    raise RuntimeError("prepared result requires a committer")
+                prepared_ref, prepared = result_preparer(completed)
+                if not isinstance(prepared_ref, str) or not prepared_ref.strip():
+                    raise RuntimeError("prepared result requires durable evidence")
+            elif result_validator is not None and status is DispatchStatus.COMPLETED:
                 validation = result_validator(completed)
         except Exception:
             evidence = self._evidence_ref(
@@ -1318,6 +1529,52 @@ class CapabilityBroker:
                 )
             )
             raise
+        if prepared_ref is not None:
+            try:
+                self.journal.record_effect(
+                    grant.effect_id,
+                    grant.fence,
+                    EffectState.PREPARED,
+                    prepared_ref,
+                )
+            except JournalError:
+                return (
+                    EffectResult(
+                        DispatchStatus.RECONCILIATION_REQUIRED,
+                        grant.effect_id,
+                        grant.fence,
+                        completed.returncode,
+                        stdout,
+                        stderr,
+                        None,
+                    ),
+                    prepared,
+                )
+
+            def validate_commit_authority() -> None:
+                self._validate_grant(grant)
+                self.journal.record_effect(
+                    grant.effect_id,
+                    grant.fence,
+                    EffectState.PREPARED,
+                    prepared_ref,
+                )
+
+            try:
+                validation = result_committer(prepared, validate_commit_authority)
+            except Exception:  # noqa: BLE001 - commit failures require reconciliation
+                return (
+                    EffectResult(
+                        DispatchStatus.RECONCILIATION_REQUIRED,
+                        grant.effect_id,
+                        grant.fence,
+                        completed.returncode,
+                        stdout,
+                        stderr,
+                        None,
+                    ),
+                    prepared,
+                )
         evidence = self._evidence_ref(
             grant,
             returncode=completed.returncode,
@@ -1325,6 +1582,8 @@ class CapabilityBroker:
             stderr=stderr,
             outcome=status.value,
         )
+        if prepared_ref is not None:
+            evidence = prepared_ref
         try:
             self.journal.record_effect(
                 grant.effect_id, grant.fence, EffectState.COMPLETED, evidence
@@ -1341,6 +1600,20 @@ class CapabilityBroker:
                     None,
                 ),
                 validation,
+            )
+        if status is DispatchStatus.DENIED:
+            self._record_decision(
+                BrokerDecision(
+                    grant.request_digest,
+                    False,
+                    "worker-sandbox-denied",
+                    self._clock(),
+                    grant.capability,
+                    grant.resource,
+                    grant.run_id,
+                    grant.run_revision,
+                    self.policy.digest,
+                )
             )
         return (
             EffectResult(

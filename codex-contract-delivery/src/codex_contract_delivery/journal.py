@@ -9,7 +9,7 @@ import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 
@@ -60,6 +60,7 @@ class JournalStorageError(JournalError):
 class EffectState(str, Enum):
     INTENT = "intent"
     STARTED = "started"
+    PREPARED = "prepared"
     COMPLETED = "completed"
     RECONCILED = "reconciled"
 
@@ -193,7 +194,7 @@ CREATE TABLE IF NOT EXISTS effects (
     CHECK (
         (state IN ('intent', 'started', 'reconciled') AND evidence_ref IS NULL)
         OR
-        (state = 'completed' AND length(evidence_ref) > 0)
+        (state IN ('prepared', 'completed') AND length(evidence_ref) > 0)
     ),
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
 ) STRICT;
@@ -286,7 +287,7 @@ BEGIN
 END;
 
 INSERT INTO journal_metadata(singleton, schema_version, last_observed_time)
-VALUES (1, 2, NULL);
+VALUES (1, 3, NULL);
 """
 
 
@@ -327,12 +328,26 @@ def _sql_manifest(
     return manifest
 
 
-_CURRENT_SCHEMA_VERSION = 2
+_CURRENT_SCHEMA_VERSION = 3
 _CURRENT_SCHEMA_STATEMENTS = _sql_statements(_SCHEMA)
 _CURRENT_SQL_MANIFEST = _sql_manifest(_CURRENT_SCHEMA_STATEMENTS)
+_V2_SCHEMA = (
+    _SCHEMA.replace(", 'prepared'", "")
+    .replace(
+        "(state IN ('intent', 'started', 'reconciled') AND evidence_ref IS NULL)\n"
+        "        OR\n"
+        "        (state IN ('prepared', 'completed') AND length(evidence_ref) > 0)",
+        "(state IN ('intent', 'started', 'reconciled') AND evidence_ref IS NULL)\n"
+        "        OR\n"
+        "        (state = 'completed' AND length(evidence_ref) > 0)",
+    )
+    .replace("VALUES (1, 3, NULL);", "VALUES (1, 2, NULL);")
+)
+_V2_SCHEMA_STATEMENTS = _sql_statements(_V2_SCHEMA)
+_V2_SQL_MANIFEST = _sql_manifest(_V2_SCHEMA_STATEMENTS)
 # Commits 43a520d and 6618ed0 published the same v1 DDL; it differs from v2
 # only in reconciliation uniqueness and the metadata seed version.
-_V1_SCHEMA = _SCHEMA.replace(
+_V1_SCHEMA = _V2_SCHEMA.replace(
     "UNIQUE (effect_id, fence),",
     "UNIQUE (effect_id, fence, outcome, evidence_ref),",
 ).replace("VALUES (1, 2, NULL);", "VALUES (1, 1, NULL);")
@@ -467,9 +482,59 @@ _V1_TO_V2_STATEMENTS = (
     FROM reconciliations_v1 ORDER BY reconciliation_id""",
     "DROP TABLE reconciliations_v1",
 )
+_V2_TO_V3_STATEMENTS = (
+    "DROP TRIGGER terminal_effects_are_immutable",
+    "DROP TRIGGER leases_fence_must_advance",
+    "DROP TRIGGER reconciliations_are_immutable_on_update",
+    "DROP TRIGGER reconciliations_are_immutable_on_delete",
+    "DROP INDEX idx_effects_run_state",
+    "DROP INDEX idx_reconciliations_effect",
+    "ALTER TABLE leases RENAME TO leases_v2",
+    "ALTER TABLE reconciliations RENAME TO reconciliations_v2",
+    "ALTER TABLE effects RENAME TO effects_v2",
+    _object_statement(_CURRENT_SCHEMA_STATEMENTS, "table", "effects"),
+    _object_statement(_CURRENT_SCHEMA_STATEMENTS, "table", "reconciliations"),
+    _object_statement(_CURRENT_SCHEMA_STATEMENTS, "table", "leases"),
+    _object_statement(_CURRENT_SCHEMA_STATEMENTS, "index", "idx_effects_run_state"),
+    _object_statement(
+        _CURRENT_SCHEMA_STATEMENTS, "index", "idx_reconciliations_effect"
+    ),
+    _object_statement(
+        _CURRENT_SCHEMA_STATEMENTS, "trigger", "terminal_effects_are_immutable"
+    ),
+    _object_statement(
+        _CURRENT_SCHEMA_STATEMENTS, "trigger", "leases_fence_must_advance"
+    ),
+    _object_statement(
+        _CURRENT_SCHEMA_STATEMENTS,
+        "trigger",
+        "reconciliations_are_immutable_on_update",
+    ),
+    _object_statement(
+        _CURRENT_SCHEMA_STATEMENTS,
+        "trigger",
+        "reconciliations_are_immutable_on_delete",
+    ),
+    """INSERT INTO effects(
+        run_id, effect_id, kind, state, evidence_ref, created_at, updated_at
+    )
+    SELECT run_id, effect_id, kind, state, evidence_ref, created_at, updated_at
+    FROM effects_v2""",
+    """INSERT INTO reconciliations(
+        reconciliation_id, run_id, effect_id, fence, outcome, evidence_ref, observed_at
+    )
+    SELECT reconciliation_id, run_id, effect_id, fence, outcome, evidence_ref, observed_at
+    FROM reconciliations_v2 ORDER BY reconciliation_id""",
+    """INSERT INTO leases(run_id, effect_id, worker_id, fence, expires_at)
+    SELECT run_id, effect_id, worker_id, fence, expires_at FROM leases_v2""",
+    "DROP TABLE leases_v2",
+    "DROP TABLE reconciliations_v2",
+    "DROP TABLE effects_v2",
+)
 _MIGRATIONS: dict[int, tuple[str, ...]] = {
     0: _BA17_TO_V1_STATEMENTS,
     1: _V1_TO_V2_STATEMENTS,
+    2: _V2_TO_V3_STATEMENTS,
 }
 
 _V0_COLUMN_SIGNATURES = {
@@ -895,7 +960,11 @@ class Journal:
 
             allowed = {
                 EffectState.INTENT: {EffectState.STARTED},
-                EffectState.STARTED: {EffectState.COMPLETED},
+                EffectState.STARTED: {
+                    EffectState.PREPARED,
+                    EffectState.COMPLETED,
+                },
+                EffectState.PREPARED: {EffectState.COMPLETED},
                 EffectState.COMPLETED: set(),
                 EffectState.RECONCILED: set(),
             }
@@ -905,15 +974,69 @@ class Journal:
                 )
             if target is EffectState.STARTED and evidence_ref is not None:
                 raise EffectConflict("started effect cannot carry completion evidence")
-            if target in {EffectState.COMPLETED, EffectState.RECONCILED} and (
-                not isinstance(evidence_ref, str) or not evidence_ref.strip()
-            ):
+            if target in {
+                EffectState.PREPARED,
+                EffectState.COMPLETED,
+                EffectState.RECONCILED,
+            } and (not isinstance(evidence_ref, str) or not evidence_ref.strip()):
                 raise EffectConflict(f"{target.value} effect requires evidence")
 
             self._connection.execute(
                 "UPDATE effects SET state = ?, evidence_ref = ?, updated_at = ? "
                 "WHERE effect_id = ?",
                 (target.value, evidence_ref, _format_time(now), effect_id),
+            )
+
+    def adopt_prepared(
+        self,
+        effect_id: str,
+        fence: int,
+        prior_evidence_ref: str,
+        adopted_evidence_ref: str,
+    ) -> None:
+        """Atomically rebind a durable stage to the current live retry fence."""
+        _require_identifier("effect_id", effect_id)
+        if not isinstance(fence, int) or fence <= 0:
+            raise StaleFence("fence must be a positive integer")
+        if any(
+            not isinstance(value, str) or not value.strip()
+            for value in (prior_evidence_ref, adopted_evidence_ref)
+        ):
+            raise EffectConflict("prepared adoption requires durable evidence")
+        with self._authority_transaction() as now:
+            row = self._connection.execute(
+                "SELECT e.state, e.evidence_ref, l.fence, l.expires_at "
+                "FROM effects e LEFT JOIN leases l "
+                "ON l.run_id = e.run_id AND l.effect_id = e.effect_id "
+                "WHERE e.effect_id = ?",
+                (effect_id,),
+            ).fetchone()
+            if row is None:
+                raise EffectNotFound(f"effect {effect_id} does not exist")
+            if EffectState(row["state"]) is not EffectState.PREPARED:
+                raise EffectConflict("only a prepared effect can be adopted")
+            if row["evidence_ref"] == adopted_evidence_ref:
+                if row["fence"] != fence:
+                    raise StaleFence("prepared adoption fence is no longer current")
+                return
+            if row["evidence_ref"] != prior_evidence_ref:
+                raise EffectConflict("prepared adoption evidence conflicts")
+            if (
+                row["fence"] is None
+                or row["fence"] != fence
+                or _parse_time(row["expires_at"]) <= now
+            ):
+                raise StaleFence("prepared adoption fence is not live")
+            self._connection.execute(
+                "UPDATE effects SET evidence_ref = ?, updated_at = ? "
+                "WHERE effect_id = ? AND state = ? AND evidence_ref = ?",
+                (
+                    adopted_evidence_ref,
+                    _format_time(now),
+                    effect_id,
+                    EffectState.PREPARED.value,
+                    prior_evidence_ref,
+                ),
             )
 
     def record_reconciliation(
@@ -969,7 +1092,11 @@ class Journal:
                         f"fence {fence} did not commit terminal effect {effect_id}"
                     )
                 raise EffectConflict("completed reconciliation evidence is immutable")
-            if current not in {EffectState.STARTED, EffectState.RECONCILED}:
+            if current not in {
+                EffectState.STARTED,
+                EffectState.PREPARED,
+                EffectState.RECONCILED,
+            }:
                 raise EffectConflict(
                     f"effect in {current.value} does not require reconciliation"
                 )
@@ -1004,11 +1131,12 @@ class Journal:
                     ),
                 )
             elif normalized_outcome is ReconciliationOutcome.OBSERVED_ABSENT:
-                self._connection.execute(
-                    "UPDATE effects SET state = ?, evidence_ref = NULL, updated_at = ? "
-                    "WHERE effect_id = ?",
-                    (EffectState.INTENT.value, _format_time(now), effect_id),
-                )
+                if current is not EffectState.PREPARED:
+                    self._connection.execute(
+                        "UPDATE effects SET state = ?, evidence_ref = NULL, updated_at = ? "
+                        "WHERE effect_id = ?",
+                        (EffectState.INTENT.value, _format_time(now), effect_id),
+                    )
                 self._connection.execute(
                     "UPDATE leases SET expires_at = ? WHERE run_id = ? AND effect_id = ?",
                     (_format_time(now), row["run_id"], effect_id),
@@ -1150,19 +1278,19 @@ class Journal:
             or value.utcoffset() is None
         ):
             raise ValueError("clock must return a timezone-aware datetime")
-        return value.astimezone(timezone.utc)
+        return value.astimezone(UTC)
 
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _format_time(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
+    return value.astimezone(UTC).isoformat(timespec="microseconds")
 
 
 def _parse_time(value: str) -> datetime:
-    return datetime.fromisoformat(value).astimezone(timezone.utc)
+    return datetime.fromisoformat(value).astimezone(UTC)
 
 
 def _require_identifier(name: str, value: object) -> None:
