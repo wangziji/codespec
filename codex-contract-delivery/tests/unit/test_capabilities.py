@@ -23,6 +23,7 @@ from codex_contract_delivery.journal import (
     EffectState,
     Journal,
     ReconciliationOutcome,
+    StaleFence,
     TransitionRequest,
 )
 from codex_contract_delivery.schema import SchemaRegistry
@@ -121,6 +122,22 @@ def request(root: Path, **changes: object) -> CapabilityRequest:
     return CapabilityRequest(**values)
 
 
+def worker_argv(root: Path) -> tuple[str, ...]:
+    return (
+        PRINTF,
+        "exec",
+        "--sandbox",
+        "workspace-write",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--cd",
+        str(root.resolve()),
+        "--json",
+        "-",
+    )
+
+
 def test_extension_payload_cannot_dispatch_mutation(tmp_path: Path) -> None:
     """Would fail if untrusted prompt provenance could acquire write authority."""
     clock = MutableClock()
@@ -207,6 +224,157 @@ def test_authorize_returns_immutable_content_addressed_short_lived_grant(
     assert grant.allowed_write_roots == (str(tmp_path.resolve()),)
     with pytest.raises(dataclasses.FrozenInstanceError):
         grant.resource = "prod"
+    journal.close()
+
+
+def test_worker_success_near_policy_timeout_keeps_commit_authority(
+    tmp_path: Path,
+) -> None:
+    """Would fail if worker runtime consumed the authority reserved for commit."""
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+    observed_timeouts: list[object] = []
+
+    def near_timeout(
+        argv: tuple[str, ...], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        observed_timeouts.append(kwargs["timeout"])
+        clock.advance(timedelta(seconds=29))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(
+            policy_record(tmp_path, capability="worker.implementation")
+        ),
+        journal,
+        clock=clock,
+        process_runner=near_timeout,
+    )
+    command = worker_argv(tmp_path)
+    grant = broker.authorize(
+        request(
+            tmp_path,
+            capability="worker.implementation",
+            requested_argv=command,
+        ),
+        context,
+    )
+    stage_ref = "effect-stage://sha256/" + "a" * 64
+
+    def commit(prepared: object, authority_check: object) -> str:
+        assert prepared == "prepared"
+        assert callable(authority_check)
+        authority_check(29.0)
+        return "committed"
+
+    result, validation = broker._dispatch(
+        grant,
+        command,
+        result_preparer=lambda _completed: (stage_ref, "prepared"),
+        result_committer=commit,
+    )
+
+    assert observed_timeouts == [30]
+    assert result.status is DispatchStatus.COMPLETED
+    assert validation == "committed"
+    assert journal.get_effect("run-1", "effect-1").state is EffectState.COMPLETED
+    journal.close()
+
+
+def test_worker_grant_and_lease_share_the_bounded_commit_expiry(
+    tmp_path: Path,
+) -> None:
+    """Would fail if either grant or fence expired inside the commit budget."""
+    clock = MutableClock()
+    issued_at = clock.now
+    journal, context = seed(tmp_path, clock)
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(
+            policy_record(
+                tmp_path,
+                capability="worker.implementation",
+                timeout_seconds=1,
+            )
+        ),
+        journal,
+        clock=clock,
+    )
+    command = worker_argv(tmp_path)
+    grant = broker.authorize(
+        request(
+            tmp_path,
+            capability="worker.implementation",
+            requested_argv=command,
+        ),
+        context,
+    )
+    stage_ref = "effect-stage://sha256/" + "a" * 64
+    journal.record_effect(grant.effect_id, grant.fence, EffectState.STARTED, None)
+    journal.record_effect(grant.effect_id, grant.fence, EffectState.PREPARED, stage_ref)
+
+    clock.advance(timedelta(seconds=0.5))
+    broker._validate_grant(grant, minimum_validity_seconds=29.0)
+    journal.record_effect(
+        grant.effect_id,
+        grant.fence,
+        EffectState.PREPARED,
+        stage_ref,
+        minimum_lease_ttl=timedelta(seconds=29),
+    )
+
+    clock.advance(timedelta(seconds=29.5))
+    assert clock.now == issued_at + timedelta(seconds=30)
+    with pytest.raises(CapabilityDenied, match="grant expired"):
+        broker._validate_grant(grant)
+    with pytest.raises(StaleFence, match="not current"):
+        journal.record_effect(
+            grant.effect_id, grant.fence, EffectState.PREPARED, stage_ref
+        )
+    journal.close()
+
+
+def test_extended_worker_authority_does_not_extend_process_timeout(
+    tmp_path: Path,
+) -> None:
+    """Would fail if commit authority lengthened worker execution itself."""
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+    observed_timeouts: list[object] = []
+
+    def timeout(
+        argv: tuple[str, ...], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        observed_timeouts.append(kwargs["timeout"])
+        clock.advance(timedelta(seconds=1.1))
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(
+            policy_record(
+                tmp_path,
+                capability="worker.implementation",
+                timeout_seconds=1,
+            )
+        ),
+        journal,
+        clock=clock,
+        process_runner=timeout,
+    )
+    command = worker_argv(tmp_path)
+    grant = broker.authorize(
+        request(
+            tmp_path,
+            capability="worker.implementation",
+            requested_argv=command,
+        ),
+        context,
+    )
+
+    result = broker.dispatch(grant, command)
+
+    assert observed_timeouts == [1]
+    assert result.status is DispatchStatus.RECONCILIATION_REQUIRED
+    assert journal.get_effect("run-1", "effect-1").state is EffectState.STARTED
     journal.close()
 
 

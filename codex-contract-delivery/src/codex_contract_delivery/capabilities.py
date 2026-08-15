@@ -68,6 +68,7 @@ _FORBIDDEN_ENV_PARTS = (
 _FORBIDDEN_ENV_PREFIXES = ("AWS_", "GITHUB_", "DB_", "DATABASE_")
 _TERM_GRACE_SECONDS = 0.25
 _KILL_GRACE_SECONDS = 0.25
+WORKER_COMMIT_AUTHORITY_SECONDS = 29.0
 
 
 def _utc_now() -> datetime:
@@ -822,7 +823,17 @@ class CapabilityBroker:
             request_digest, request, rule, resource
         )
         issued_at = self._clock()
-        lease_ttl = rule.timeout_seconds * 2 + _TERM_GRACE_SECONDS + _KILL_GRACE_SECONDS
+        commit_authority_seconds = (
+            WORKER_COMMIT_AUTHORITY_SECONDS
+            if request.capability in {"worker.analysis", "worker.implementation"}
+            else 0.0
+        )
+        dispatch_authority_seconds = (
+            rule.timeout_seconds + _TERM_GRACE_SECONDS + _KILL_GRACE_SECONDS
+        )
+        lease_ttl = rule.timeout_seconds + max(
+            dispatch_authority_seconds, commit_authority_seconds
+        )
         try:
             lease = self.journal.acquire_attempt(
                 context.run_id,
@@ -882,7 +893,8 @@ class CapabilityBroker:
             "fence": lease.fence,
             "worker_id": context.worker_id,
             "issued_at": issued_at,
-            "expires_at": issued_at + timedelta(seconds=rule.timeout_seconds),
+            "expires_at": issued_at
+            + timedelta(seconds=rule.timeout_seconds + commit_authority_seconds),
             "lease_expires_at": lease.expires_at,
         }
         provisional = Grant("", **content)

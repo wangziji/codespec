@@ -23,10 +23,10 @@ from hashlib import sha256
 from pathlib import Path
 
 from .canonical import canonical_digest
+from .capabilities import WORKER_COMMIT_AUTHORITY_SECONDS
 from .vm_guest import MAX_SOURCE_SNAPSHOT_BYTES, MAX_WORKER_REQUEST_BYTES
 from .worker import WorkerKind, WorkerLauncher, WorkerTask, WorkerViolation
 
-_COMMIT_PREPARATION_SECONDS = 10.0
 _GIT_APPLY_SECONDS = 5.0
 _GIT_TERMINATION_SECONDS = 2.0
 _POST_APPLY_VERIFICATION_SECONDS = 5.0
@@ -37,6 +37,9 @@ _COMMIT_MUTATION_AUTHORITY_SECONDS = (
     + _POST_APPLY_VERIFICATION_SECONDS
     + _ROLLBACK_SECONDS
     + _GIT_TERMINATION_SECONDS
+)
+_COMMIT_PREPARATION_SECONDS = (
+    WORKER_COMMIT_AUTHORITY_SECONDS - _COMMIT_MUTATION_AUTHORITY_SECONDS
 )
 
 
@@ -112,6 +115,7 @@ class PreparedExport:
 class SourceSnapshot:
     digest: str
     archive: bytes
+    source_digest: str
 
 
 @dataclass(frozen=True)
@@ -123,6 +127,31 @@ class _SnapshotEntry:
     details: os.stat_result
     link_details: os.stat_result | None
     link_target: str | None
+
+
+class _SnapshotDigestWriter:
+    def __init__(self, payload_size: int) -> None:
+        self._payload_size = payload_size
+        self._position = 0
+        self._hashed = 0
+        self._digest = sha256()
+
+    def write(self, value: bytes) -> int:
+        remaining = self._payload_size - self._hashed
+        if remaining > 0:
+            selected = value[:remaining]
+            self._digest.update(selected)
+            self._hashed += len(selected)
+        self._position += len(value)
+        return len(value)
+
+    def tell(self) -> int:
+        return self._position
+
+    def hexdigest(self) -> str:
+        if self._hashed != self._payload_size:
+            raise WorkerViolation("tracked source snapshot size drifted")
+        return self._digest.hexdigest()
 
 
 def _snapshot_tar_info(entry: _SnapshotEntry) -> tarfile.TarInfo:
@@ -195,8 +224,9 @@ def _read_link_beneath(root: Path, candidate: Path) -> tuple[os.stat_result, str
         os.close(parent)
 
 
-def create_source_snapshot(source: Path) -> SourceSnapshot:
-    """Build a deterministic, tracked-only snapshot without exposing git metadata."""
+def _plan_source_snapshot(
+    source: Path,
+) -> tuple[tuple[_SnapshotEntry, ...], int]:
     entries: list[tuple[str, Path, str]] = []
     modes: dict[str, str] = {}
     process = subprocess.Popen(
@@ -317,7 +347,15 @@ def create_source_snapshot(source: Path) -> SourceSnapshot:
             raise WorkerViolation("tracked source snapshot exceeds payload limit")
         planned.append(planned_entry)
 
-    output = io.BytesIO()
+    return tuple(planned), payload_size
+
+
+def _write_source_snapshot(
+    source: Path,
+    planned: tuple[_SnapshotEntry, ...],
+    payload_size: int,
+    output: io.BytesIO | _SnapshotDigestWriter,
+) -> None:
     with tarfile.open(fileobj=output, mode="w", format=tarfile.PAX_FORMAT) as archive:
         for entry in planned:
             descriptor = _open_regular_beneath(source, entry.source_candidate)
@@ -354,9 +392,47 @@ def create_source_snapshot(source: Path) -> SourceSnapshot:
                 os.close(descriptor)
         if archive.offset + 1024 != payload_size:
             raise WorkerViolation("tracked source snapshot size drifted")
+
+
+def _source_state_digest(
+    archive_digest: str, planned: tuple[_SnapshotEntry, ...]
+) -> str:
+    return canonical_digest(
+        {
+            "archive_sha256": archive_digest,
+            "entries": tuple(
+                {
+                    "path": entry.relative,
+                    "live_mode": stat.S_IMODE(entry.details.st_mode),
+                    "link_target": entry.link_target,
+                }
+                for entry in planned
+            ),
+        }
+    )
+
+
+def _current_source_snapshot_digests(source: Path) -> tuple[str, str]:
+    planned, payload_size = _plan_source_snapshot(source)
+    output = _SnapshotDigestWriter(payload_size)
+    _write_source_snapshot(source, planned, payload_size, output)
+    archive_digest = output.hexdigest()
+    return archive_digest, _source_state_digest(archive_digest, planned)
+
+
+def create_source_snapshot(source: Path) -> SourceSnapshot:
+    """Build a deterministic, tracked-only snapshot without exposing git metadata."""
+    planned, payload_size = _plan_source_snapshot(source)
+    output = io.BytesIO()
+    _write_source_snapshot(source, planned, payload_size, output)
     output.truncate(payload_size)
     value = output.getvalue()
-    return SourceSnapshot(sha256(value).hexdigest(), value)
+    archive_digest = sha256(value).hexdigest()
+    return SourceSnapshot(
+        archive_digest,
+        value,
+        _source_state_digest(archive_digest, planned),
+    )
 
 
 class LimaWorkerBackend:
@@ -631,6 +707,14 @@ class LimaWorkerBackend:
         snapshot = self._source_snapshots.get(task.fingerprint())
         if snapshot is None:
             raise WorkerViolation("tracked source snapshot is not authorized")
+        current_digest, current_source_digest = _current_source_snapshot_digests(
+            task.approved_root.resolve(strict=True)
+        )
+        if (
+            current_digest != snapshot.digest
+            or current_source_digest != snapshot.source_digest
+        ):
+            raise WorkerViolation("tracked source snapshot drifted after authorization")
         return {
             "source_snapshot_sha256": snapshot.digest,
             "source_snapshot_b64": base64.b64encode(snapshot.archive).decode("ascii"),
@@ -1066,9 +1150,7 @@ class LimaWorkerBackend:
         expected_after = dict(prepared.after_manifest)
         preparation_deadline = self._monotonic_clock() + _COMMIT_PREPARATION_SECONDS
         with self._root_lock(root, deadline=preparation_deadline):
-            authority_check(
-                _COMMIT_PREPARATION_SECONDS + _COMMIT_MUTATION_AUTHORITY_SECONDS
-            )
+            authority_check(WORKER_COMMIT_AUTHORITY_SECONDS)
             progress_check = lambda: self._commit_progress_check(preparation_deadline)
             patch, metadata = self._load_stage(prepared, progress_check=progress_check)
             if (

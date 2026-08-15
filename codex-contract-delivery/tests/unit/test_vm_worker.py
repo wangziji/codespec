@@ -319,6 +319,67 @@ def test_lima_command_binds_host_tracked_snapshot_not_source_git(
     assert base64.b64decode(payload["source_snapshot_b64"], validate=True)
 
 
+def test_request_payload_reuses_the_only_authorized_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if post-baseline validation retained a second archive."""
+    backend = LimaWorkerBackend(config(tmp_path))
+    source = tmp_path / "readonly-mount" / "task"
+    source.mkdir()
+    initialize_git(source)
+    task = WorkerTask(WorkerKind.ANALYSIS, source, "inspect")
+    backend.canonical_command(task)
+
+    def reject_second_archive(_source: Path) -> SourceSnapshot:
+        raise AssertionError("request payload must reuse the authorized archive")
+
+    monkeypatch.setattr(
+        "codex_contract_delivery.vm_worker.create_source_snapshot",
+        reject_second_archive,
+    )
+
+    payload = backend.request_payload(task)
+
+    assert base64.b64decode(payload["source_snapshot_b64"], validate=True)
+
+
+@pytest.mark.parametrize("mutation", ["content", "mode", "symlink", "tracked-set"])
+def test_request_payload_revalidates_tracked_source_after_command_selection(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """Would fail if the guest could receive a snapshot older than the host baseline."""
+    backend = LimaWorkerBackend(config(tmp_path))
+    source = tmp_path / "readonly-mount" / "task"
+    source.mkdir()
+    initialize_git(source)
+    (source / "other.txt").write_text("other\n", encoding="utf-8")
+    (source / "alias.txt").symlink_to("tracked.txt")
+    subprocess.run(
+        ("git", "-C", str(source), "add", "other.txt", "alias.txt"), check=True
+    )
+    subprocess.run(
+        ("git", "-C", str(source), "commit", "-qm", "tracked inputs"), check=True
+    )
+    task = WorkerTask(WorkerKind.ANALYSIS, source, "inspect")
+    backend.canonical_command(task)
+
+    if mutation == "content":
+        (source / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    elif mutation == "mode":
+        (source / "tracked.txt").chmod(0o755)
+    elif mutation == "symlink":
+        (source / "alias.txt").unlink()
+        (source / "alias.txt").symlink_to("other.txt")
+    else:
+        (source / "added.txt").write_text("added\n", encoding="utf-8")
+        subprocess.run(("git", "-C", str(source), "add", "added.txt"), check=True)
+
+    with pytest.raises(WorkerViolation, match="snapshot drifted after authorization"):
+        backend.request_payload(task)
+
+
 def test_each_lima_dispatch_rejects_runner_or_mount_authority_drift(
     tmp_path: Path,
 ) -> None:
