@@ -325,6 +325,162 @@ def test_expired_grant_before_started_never_calls_runner(tmp_path: Path) -> None
     journal.close()
 
 
+def test_environment_preflight_failure_leaves_worker_effect_intent(
+    tmp_path: Path,
+) -> None:
+    """Would fail if durable STARTED preceded child environment construction."""
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+    runner_calls: list[tuple[str, ...]] = []
+
+    def runner(
+        argv: tuple[str, ...], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        runner_calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(
+            policy_record(tmp_path, capability="worker.implementation")
+        ),
+        journal,
+        clock=clock,
+        process_runner=runner,
+    )
+    command = worker_argv(tmp_path)
+    grant = broker.authorize(
+        request(
+            tmp_path,
+            capability="worker.implementation",
+            requested_argv=command,
+        ),
+        context,
+    )
+
+    def environment_failure(*_args: object, **_kwargs: object) -> dict[str, str]:
+        raise RuntimeError("environment preflight failed")
+
+    broker._child_environment = environment_failure  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="environment preflight failed"):
+        broker._dispatch(grant, command)
+
+    assert runner_calls == []
+    effect = journal.get_effect("run-1", grant.effect_id)
+    assert effect is not None
+    assert effect.state is EffectState.INTENT
+    journal.close()
+
+
+def test_approval_policy_drift_after_started_keeps_prepared_without_mutation(
+    tmp_path: Path,
+) -> None:
+    """Would fail if host commit ignored the changed live approval binding."""
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(
+            policy_record(tmp_path, capability="worker.implementation")
+        ),
+        journal,
+        clock=clock,
+        process_runner=lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv, 0, "", ""
+        ),
+    )
+    command = worker_argv(tmp_path)
+    grant = broker.authorize(
+        request(
+            tmp_path,
+            capability="worker.implementation",
+            requested_argv=command,
+        ),
+        context,
+    )
+    changed_policy = policy_record(tmp_path, capability="worker.implementation")
+    changed_policy["policies"][0]["approval_digest"] = DIGEST_C
+    mutation_calls: list[str] = []
+    stage_ref = "effect-stage://sha256/" + "a" * 64
+
+    def prepare(_completed: subprocess.CompletedProcess[str]) -> tuple[str, object]:
+        broker.policy = CapabilityPolicy.from_mapping(changed_policy)
+        return stage_ref, "prepared"
+
+    def commit(prepared: object, authority: object, authority_check: object) -> str:
+        assert prepared == "prepared"
+        assert authority.effect_id == grant.effect_id
+        authority_check(1.0)
+        mutation_calls.append("mutated")
+        return "committed"
+
+    result, _ = broker._dispatch(
+        grant,
+        command,
+        result_preparer=prepare,
+        result_committer=commit,
+    )
+
+    assert result.status is DispatchStatus.RECONCILIATION_REQUIRED
+    assert mutation_calls == []
+    effect = journal.get_effect("run-1", grant.effect_id)
+    assert effect is not None
+    assert effect.state is EffectState.PREPARED
+    assert effect.evidence_ref == stage_ref
+    journal.close()
+
+
+def test_lease_takeover_after_started_blocks_commit_callback(tmp_path: Path) -> None:
+    """Would fail if a stale worker fence could prepare or commit a result."""
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(
+            policy_record(tmp_path, capability="worker.implementation")
+        ),
+        journal,
+        clock=clock,
+        process_runner=lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv, 0, "", ""
+        ),
+    )
+    command = worker_argv(tmp_path)
+    grant = broker.authorize(
+        request(
+            tmp_path,
+            capability="worker.implementation",
+            requested_argv=command,
+        ),
+        context,
+    )
+    stage_ref = "effect-stage://sha256/" + "a" * 64
+    commit_calls: list[object] = []
+
+    def prepare(_completed: subprocess.CompletedProcess[str]) -> tuple[str, object]:
+        clock.advance(timedelta(seconds=64))
+        takeover = journal.acquire_attempt(
+            grant.run_id,
+            grant.effect_id,
+            "controller-2",
+            timedelta(seconds=30),
+        )
+        assert takeover.fence == grant.fence + 1
+        return stage_ref, "prepared"
+
+    result, _ = broker._dispatch(
+        grant,
+        command,
+        result_preparer=prepare,
+        result_committer=lambda *_args: commit_calls.append(object()),
+    )
+
+    assert result.status is DispatchStatus.RECONCILIATION_REQUIRED
+    assert commit_calls == []
+    effect = journal.get_effect("run-1", grant.effect_id)
+    assert effect is not None
+    assert effect.state is EffectState.STARTED
+    journal.close()
+
+
 def test_live_run_drift_after_started_keeps_prepared(tmp_path: Path) -> None:
     """Would fail if commit checks ignored a live run revision/state change."""
     clock = MutableClock()

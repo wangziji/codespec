@@ -1514,6 +1514,9 @@ class CapabilityBroker:
             )
         authority: ExecutionAuthority | None = None
         try:
+            child_environment = self._child_environment(
+                grant, isolated_home=isolated_home
+            )
             try:
                 if grant.capability in {"worker.analysis", "worker.implementation"}:
                     authority = self.journal.begin_dispatch(
@@ -1546,7 +1549,7 @@ class CapabilityBroker:
                 execution_command,
                 input=stdin_text,
                 cwd=cwd,
-                env=self._child_environment(grant, isolated_home=isolated_home),
+                env=child_environment,
                 timeout=grant.timeout_seconds,
                 shell=False,
                 capture_output=True,
