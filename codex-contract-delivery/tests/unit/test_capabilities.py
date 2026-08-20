@@ -23,7 +23,6 @@ from codex_contract_delivery.journal import (
     EffectState,
     Journal,
     ReconciliationOutcome,
-    StaleFence,
     TransitionRequest,
 )
 from codex_contract_delivery.schema import SchemaRegistry
@@ -227,10 +226,10 @@ def test_authorize_returns_immutable_content_addressed_short_lived_grant(
     journal.close()
 
 
-def test_worker_success_near_policy_timeout_keeps_commit_authority(
+def test_grant_expiry_after_started_does_not_end_execution_authority(
     tmp_path: Path,
 ) -> None:
-    """Would fail if worker runtime consumed the authority reserved for commit."""
+    """Would fail if grant admission expiry were reused as a runtime deadline."""
     clock = MutableClock()
     journal, context = seed(tmp_path, clock)
     observed_timeouts: list[object] = []
@@ -259,12 +258,17 @@ def test_worker_success_near_policy_timeout_keeps_commit_authority(
         ),
         context,
     )
+    clock.advance(timedelta(seconds=1))
     stage_ref = "effect-stage://sha256/" + "a" * 64
+    authority_check_seconds: list[float] = []
 
-    def commit(prepared: object, authority_check: object) -> str:
+    def commit(prepared: object, authority: object, authority_check: object) -> str:
         assert prepared == "prepared"
+        assert authority.started_at == datetime(2026, 8, 11, 12, 0, 1, tzinfo=UTC)
+        assert authority.worker_deadline == datetime(2026, 8, 11, 12, 0, 31, tzinfo=UTC)
         assert callable(authority_check)
-        authority_check(29.0)
+        authority_check(19.0)
+        authority_check_seconds.append(19.0)
         return "committed"
 
     result, validation = broker._dispatch(
@@ -275,16 +279,161 @@ def test_worker_success_near_policy_timeout_keeps_commit_authority(
     )
 
     assert observed_timeouts == [30]
+    assert authority_check_seconds == [19.0]
     assert result.status is DispatchStatus.COMPLETED
     assert validation == "committed"
     assert journal.get_effect("run-1", "effect-1").state is EffectState.COMPLETED
     journal.close()
 
 
-def test_worker_grant_and_lease_share_the_bounded_commit_expiry(
+def test_expired_grant_before_started_never_calls_runner(tmp_path: Path) -> None:
+    """Would fail if expiry was checked after the worker process could launch."""
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+    calls: list[tuple[str, ...]] = []
+
+    def runner(
+        argv: tuple[str, ...], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(
+            policy_record(tmp_path, capability="worker.implementation")
+        ),
+        journal,
+        clock=clock,
+        process_runner=runner,
+    )
+    command = worker_argv(tmp_path)
+    grant = broker.authorize(
+        request(
+            tmp_path,
+            capability="worker.implementation",
+            requested_argv=command,
+        ),
+        context,
+    )
+    clock.advance(grant.expires_at - clock.now)
+
+    with pytest.raises(CapabilityDenied, match="grant expired"):
+        broker._dispatch(grant, command)
+
+    assert calls == []
+    assert journal.get_effect("run-1", grant.effect_id).state is EffectState.INTENT
+    journal.close()
+
+
+def test_live_run_drift_after_started_keeps_prepared(tmp_path: Path) -> None:
+    """Would fail if commit checks ignored a live run revision/state change."""
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+
+    def runner(
+        argv: tuple[str, ...], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        journal.transition(
+            TransitionRequest("run-1", 1, RunEvent.DRAFT_REQUIREMENTS, {})
+        )
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(
+            policy_record(tmp_path, capability="worker.implementation")
+        ),
+        journal,
+        clock=clock,
+        process_runner=runner,
+    )
+    command = worker_argv(tmp_path)
+    grant = broker.authorize(
+        request(
+            tmp_path,
+            capability="worker.implementation",
+            requested_argv=command,
+        ),
+        context,
+    )
+    stage_ref = "effect-stage://sha256/" + "a" * 64
+
+    def commit(prepared: object, authority: object, authority_check: object) -> str:
+        assert prepared == "prepared"
+        assert authority.effect_id == grant.effect_id
+        assert callable(authority_check)
+        authority_check(1.0)
+        return "committed"
+
+    result, _ = broker._dispatch(
+        grant,
+        command,
+        result_preparer=lambda _completed: (stage_ref, "prepared"),
+        result_committer=commit,
+    )
+
+    assert result.status is DispatchStatus.RECONCILIATION_REQUIRED
+    effect = journal.get_effect("run-1", grant.effect_id)
+    assert effect is not None
+    assert effect.state is EffectState.PREPARED
+    assert effect.evidence_ref == stage_ref
+    journal.close()
+
+
+def test_tampered_execution_authority_is_denied(tmp_path: Path) -> None:
+    """Would fail if a result committer could forge an authority fence."""
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+
+    def runner(
+        argv: tuple[str, ...], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(
+            policy_record(tmp_path, capability="worker.implementation")
+        ),
+        journal,
+        clock=clock,
+        process_runner=runner,
+    )
+    command = worker_argv(tmp_path)
+    grant = broker.authorize(
+        request(
+            tmp_path,
+            capability="worker.implementation",
+            requested_argv=command,
+        ),
+        context,
+    )
+    begin_dispatch = journal.begin_dispatch
+
+    def tampered_begin_dispatch(**kwargs: object) -> object:
+        authority = begin_dispatch(**kwargs)
+        return dataclasses.replace(authority, fence=authority.fence + 1)
+
+    journal.begin_dispatch = tampered_begin_dispatch  # type: ignore[method-assign]
+    committer_calls: list[object] = []
+
+    with pytest.raises(CapabilityDenied, match="execution authority"):
+        broker._dispatch(
+            grant,
+            command,
+            result_preparer=lambda _completed: (
+                "effect-stage://sha256/" + "a" * 64,
+                "prepared",
+            ),
+            result_committer=lambda *_args: committer_calls.append(object()),
+        )
+
+    assert committer_calls == []
+    journal.close()
+
+
+def test_worker_admission_grant_and_reservation_match_policy_timeout(
     tmp_path: Path,
 ) -> None:
-    """Would fail if either grant or fence expired inside the commit budget."""
+    """Would fail if worker reservation were extended before durable dispatch."""
     clock = MutableClock()
     issued_at = clock.now
     journal, context = seed(tmp_path, clock)
@@ -308,28 +457,11 @@ def test_worker_grant_and_lease_share_the_bounded_commit_expiry(
         ),
         context,
     )
-    stage_ref = "effect-stage://sha256/" + "a" * 64
-    journal.record_effect(grant.effect_id, grant.fence, EffectState.STARTED, None)
-    journal.record_effect(grant.effect_id, grant.fence, EffectState.PREPARED, stage_ref)
-
-    clock.advance(timedelta(seconds=0.5))
-    broker._validate_grant(grant, minimum_validity_seconds=29.0)
-    journal.record_effect(
-        grant.effect_id,
-        grant.fence,
-        EffectState.PREPARED,
-        stage_ref,
-        minimum_lease_ttl=timedelta(seconds=29),
-    )
-
-    clock.advance(timedelta(seconds=29.5))
-    assert clock.now == issued_at + timedelta(seconds=30)
+    assert grant.expires_at == issued_at + timedelta(seconds=1)
+    assert grant.lease_expires_at == issued_at + timedelta(seconds=1)
+    clock.advance(timedelta(seconds=1))
     with pytest.raises(CapabilityDenied, match="grant expired"):
-        broker._validate_grant(grant)
-    with pytest.raises(StaleFence, match="not current"):
-        journal.record_effect(
-            grant.effect_id, grant.fence, EffectState.PREPARED, stage_ref
-        )
+        broker._validate_grant_for_dispatch(grant)
     journal.close()
 
 
@@ -438,8 +570,9 @@ def test_prepared_adoption_commits_only_after_new_fence_is_durable(
     grant = broker.authorize_prepared_adoption(capability_request, context, prior)
     observed: list[tuple[EffectState, str | None]] = []
 
-    def commit(prepared: object, authority_check: object) -> str:
+    def commit(prepared: object, authority: object, authority_check: object) -> str:
         assert prepared == "stage-object"
+        assert authority.effect_id == grant.effect_id
         assert callable(authority_check)
         authority_check(1.0)
         effect = journal.get_effect("run-1", "effect-1")

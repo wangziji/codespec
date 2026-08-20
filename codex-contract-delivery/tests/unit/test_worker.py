@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
-
 from codex_contract_delivery.capabilities import (
     CapabilityBroker,
     CapabilityPolicy,
@@ -181,6 +181,85 @@ def test_worker_commands_are_ephemeral_sandboxed_and_receive_context_on_stdin(
     assert calls[0][1]["input"] == "controller approved context"
     assert "controller approved context" not in calls[0][0]
     assert result.changed_paths == ()
+    journal.close()
+
+
+def test_isolated_worker_commits_with_host_authority_check_only(
+    tmp_path: Path,
+) -> None:
+    """Would fail if durable host authority leaked into the guest export protocol."""
+    root = tmp_path / "worktree"
+    root.mkdir()
+    initialize_git(root)
+    request_records: list[dict[str, object]] = []
+    authority_checks: list[object] = []
+
+    def runner(
+        argv: tuple[str, ...], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        request_records.append(json.loads(str(kwargs["input"])))
+        return subprocess.CompletedProcess(argv, 0, stdout="done", stderr="")
+
+    broker, grant, journal = authorized(
+        tmp_path,
+        root,
+        capability="worker.implementation",
+        operation="write",
+        runner=runner,
+    )
+    task = WorkerTask(WorkerKind.IMPLEMENTATION, root, "write")
+
+    class Backend:
+        def canonical_command(self, current: WorkerTask) -> tuple[str, ...]:
+            return WorkerLauncher.canonical_command(current, CODEX)
+
+        def request_payload(self, current: WorkerTask) -> dict[str, str]:
+            return {}
+
+        def prepare_export(
+            self,
+            current: WorkerTask,
+            stdout: str,
+            effect_id: str,
+            fence: int,
+        ) -> tuple[str, object]:
+            return ("effect-stage://sha256/" + "a" * 64, object())
+
+        def commit_export(
+            self,
+            current: WorkerTask,
+            prepared: object,
+            authority_check: object,
+        ) -> tuple[str, ...]:
+            authority_checks.append(authority_check)
+            assert callable(authority_check)
+            authority_check(1.0)
+            return ()
+
+        def adopt_export(self, prepared: object, fence: int) -> object:
+            raise AssertionError("run must not adopt an export")
+
+        def cancel(
+            self,
+            current: WorkerTask,
+            effect_id: str,
+            task_fingerprint: str,
+            fence: int,
+        ) -> None:
+            raise AssertionError("successful run must not cancel the export")
+
+    result = WorkerLauncher(broker, backend=Backend()).run(task, grant)
+
+    assert result.effect.status is DispatchStatus.COMPLETED
+    assert len(authority_checks) == 1
+    assert set(request_records[0]) == {
+        "schema_version",
+        "approved_context",
+        "allowed_paths",
+        "effect_id",
+        "fence",
+        "task_fingerprint",
+    }
     journal.close()
 
 

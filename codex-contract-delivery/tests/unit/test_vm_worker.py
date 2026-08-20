@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import io
 import json
 import shutil
@@ -246,6 +247,16 @@ def commit_export_for_test(
 ) -> tuple[str, ...]:
     _, prepared = backend.prepare_export(task, stdout, "effect-test", 1)
     return backend.commit_export(task, prepared, lambda _required: None)
+
+
+def test_lima_export_protocol_accepts_only_host_authority_check() -> None:
+    """Would fail if broker execution authority crossed the VM export boundary."""
+    assert tuple(inspect.signature(LimaWorkerBackend.commit_export).parameters) == (
+        "self",
+        "task",
+        "prepared",
+        "authority_check",
+    )
 
 
 def test_lima_command_is_fixed_and_contains_no_prompt_or_host_credentials(

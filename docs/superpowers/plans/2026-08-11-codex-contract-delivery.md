@@ -365,6 +365,11 @@ git commit -m "feat(workflow): add recoverable execution journal"
 
 ### Task 5: Enforce the Capability Broker and Sandboxed Workers
 
+> **Approved timing amendment:** Worker admission/runtime authority follows
+> `docs/superpowers/specs/2026-08-15-task5-dispatch-authority-design.md` and
+> `docs/superpowers/plans/2026-08-21-task5-dispatch-authority.md`. This supersedes
+> Task 5 grant/lease timing only and does not widen worker capability.
+
 **Files:**
 - Create: `codex-contract-delivery/src/codex_contract_delivery/{capabilities,worker}.py`
 - Create: `codex-contract-delivery/schemas/capability-policy.schema.json`

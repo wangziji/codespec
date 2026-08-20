@@ -15,6 +15,7 @@ from typing import Protocol
 
 from .canonical import canonical_digest
 from .capabilities import CapabilityBroker, DispatchStatus, EffectResult, Grant
+from .journal import ExecutionAuthority
 
 
 class WorkerViolation(RuntimeError):
@@ -470,10 +471,15 @@ class WorkerLauncher:
 
         def commit_result(
             prepared: object,
+            authority: ExecutionAuthority,
             authority_check: Callable[[float], None],
         ) -> _GitSnapshot:
             if self.backend is None:
                 raise WorkerViolation("isolated backend is unavailable")
+            if authority.effect_id != grant.effect_id or authority.fence != grant.fence:
+                raise WorkerViolation(
+                    "execution authority does not match worker effect"
+                )
             exported_paths = self.backend.commit_export(
                 task,
                 prepared,
@@ -560,8 +566,14 @@ class WorkerLauncher:
             raise WorkerViolation("adopted stage has no durable evidence")
 
         def commit(
-            value: object, authority_check: Callable[[float], None]
+            value: object,
+            authority: ExecutionAuthority,
+            authority_check: Callable[[float], None],
         ) -> tuple[str, ...]:
+            if authority.effect_id != grant.effect_id or authority.fence != grant.fence:
+                raise WorkerViolation(
+                    "execution authority does not match worker effect"
+                )
             return self.backend.commit_export(task, value, authority_check)
 
         effect, exported = self.broker.commit_prepared_adoption(

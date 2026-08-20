@@ -24,6 +24,7 @@ from urllib.parse import unquote, urlsplit
 from .canonical import canonical_digest
 from .journal import (
     EffectState,
+    ExecutionAuthority,
     Journal,
     JournalError,
     ReconciliationRequired,
@@ -823,17 +824,19 @@ class CapabilityBroker:
             request_digest, request, rule, resource
         )
         issued_at = self._clock()
-        commit_authority_seconds = (
-            WORKER_COMMIT_AUTHORITY_SECONDS
-            if request.capability in {"worker.analysis", "worker.implementation"}
-            else 0.0
-        )
-        dispatch_authority_seconds = (
-            rule.timeout_seconds + _TERM_GRACE_SECONDS + _KILL_GRACE_SECONDS
-        )
-        lease_ttl = rule.timeout_seconds + max(
-            dispatch_authority_seconds, commit_authority_seconds
-        )
+        is_worker = request.capability in {
+            "worker.analysis",
+            "worker.implementation",
+        }
+        if is_worker:
+            lease_ttl = rule.timeout_seconds
+            grant_expires_at = issued_at + timedelta(seconds=rule.timeout_seconds)
+        else:
+            dispatch_authority_seconds = (
+                rule.timeout_seconds + _TERM_GRACE_SECONDS + _KILL_GRACE_SECONDS
+            )
+            lease_ttl = rule.timeout_seconds + dispatch_authority_seconds
+            grant_expires_at = issued_at + timedelta(seconds=rule.timeout_seconds)
         try:
             lease = self.journal.acquire_attempt(
                 context.run_id,
@@ -893,8 +896,7 @@ class CapabilityBroker:
             "fence": lease.fence,
             "worker_id": context.worker_id,
             "issued_at": issued_at,
-            "expires_at": issued_at
-            + timedelta(seconds=rule.timeout_seconds + commit_authority_seconds),
+            "expires_at": grant_expires_at,
             "lease_expires_at": lease.expires_at,
         }
         provisional = Grant("", **content)
@@ -917,15 +919,7 @@ class CapabilityBroker:
         )
         return grant
 
-    def _validate_grant(
-        self, grant: Grant, *, minimum_validity_seconds: float = 0.0
-    ) -> None:
-        if (
-            not isinstance(minimum_validity_seconds, int | float)
-            or isinstance(minimum_validity_seconds, bool)
-            or minimum_validity_seconds < 0
-        ):
-            raise ValueError("minimum grant validity must be non-negative")
+    def _validate_grant_bindings(self, grant: Grant) -> None:
         if not isinstance(grant, Grant) or not grant.verify_digest():
             self._deny("invalid-grant", "grant-digest", "grant digest is invalid")
         if self._issued.get(grant.grant_id) != grant:
@@ -944,27 +938,6 @@ class CapabilityBroker:
         if grant.policy_digest != self.policy.digest:
             self._deny(
                 grant.request_digest, "policy-drift", "capability policy changed"
-            )
-        now = self._clock()
-        if now >= grant.expires_at:
-            self._deny(grant.request_digest, "grant-expired", "grant expired")
-        minimum_valid_until = now + timedelta(seconds=minimum_validity_seconds)
-        if minimum_valid_until >= grant.expires_at:
-            self._deny(
-                grant.request_digest,
-                "grant-deadline",
-                "grant does not cover the bounded commit deadline",
-                grant=grant,
-            )
-        required_lease_until = now + timedelta(
-            seconds=(grant.timeout_seconds + _TERM_GRACE_SECONDS + _KILL_GRACE_SECONDS)
-        )
-        if grant.lease_expires_at < required_lease_until:
-            self._deny(
-                grant.request_digest,
-                "lease-deadline",
-                "lease does not cover the complete dispatch deadline",
-                grant=grant,
             )
         snapshot = self.journal.get_run(grant.run_id)
         if (
@@ -998,6 +971,40 @@ class CapabilityBroker:
                     "resource-drift",
                     "resource drifted after authorization",
                 )
+
+    def _validate_grant_for_dispatch(self, grant: Grant) -> None:
+        self._validate_grant_bindings(grant)
+        if self._clock() >= grant.expires_at:
+            self._deny(
+                grant.request_digest, "grant-expired", "grant expired", grant=grant
+            )
+
+    def _validate_execution_authority(
+        self, grant: Grant, authority: ExecutionAuthority
+    ) -> None:
+        if (
+            not isinstance(authority, ExecutionAuthority)
+            or not authority.verify_digest()
+        ):
+            self._deny(
+                grant.request_digest,
+                "execution-authority-digest",
+                "execution authority digest is invalid",
+                grant=grant,
+            )
+        if (
+            authority.grant_id != grant.grant_id
+            or authority.run_id != grant.run_id
+            or authority.effect_id != grant.effect_id
+            or authority.worker_id != grant.worker_id
+            or authority.fence != grant.fence
+        ):
+            self._deny(
+                grant.request_digest,
+                "execution-authority-mismatch",
+                "execution authority does not match the grant",
+                grant=grant,
+            )
 
     def _materialize_argv(
         self, request_digest: str, argv: Sequence[str]
@@ -1354,10 +1361,12 @@ class CapabilityBroker:
         prior_stage_ref: str,
         adopted_stage_ref: str,
         prepared: object,
-        committer: Callable[[object, Callable[[float], None]], object],
+        committer: Callable[
+            [object, ExecutionAuthority, Callable[[float], None]], object
+        ],
     ) -> tuple[EffectResult, object | None]:
         """Adopt and commit a staged result without re-running the worker."""
-        self._validate_grant(grant)
+        self._validate_grant_for_dispatch(grant)
         try:
             self.journal.adopt_prepared(
                 grant.effect_id,
@@ -1379,8 +1388,35 @@ class CapabilityBroker:
                 None,
             )
 
+        try:
+            authority = self.journal.begin_prepared_commit(
+                run_id=grant.run_id,
+                expected_revision=grant.run_revision,
+                expected_state=grant.run_state,
+                effect_id=grant.effect_id,
+                worker_id=grant.worker_id,
+                fence=grant.fence,
+                grant_id=grant.grant_id,
+                admission_expires_at=grant.expires_at,
+                expected_evidence_ref=adopted_stage_ref,
+                commit_budget=timedelta(seconds=WORKER_COMMIT_AUTHORITY_SECONDS),
+            )
+        except JournalError:
+            return (
+                EffectResult(
+                    DispatchStatus.RECONCILIATION_REQUIRED,
+                    grant.effect_id,
+                    grant.fence,
+                    None,
+                    "",
+                    "",
+                    None,
+                ),
+                None,
+            )
+
         def validate_commit_authority(required_seconds: float) -> None:
-            self._validate_grant(grant, minimum_validity_seconds=required_seconds)
+            self._validate_grant_bindings(grant)
             self.journal.record_effect(
                 grant.effect_id,
                 grant.fence,
@@ -1390,7 +1426,8 @@ class CapabilityBroker:
             )
 
         try:
-            validation = committer(prepared, validate_commit_authority)
+            self._validate_execution_authority(grant, authority)
+            validation = committer(prepared, authority, validate_commit_authority)
             self.journal.record_effect(
                 grant.effect_id,
                 grant.fence,
@@ -1434,11 +1471,13 @@ class CapabilityBroker:
             [subprocess.CompletedProcess[str]], tuple[str, object]
         ]
         | None = None,
-        result_committer: Callable[[object, Callable[[float], None]], object]
+        result_committer: Callable[
+            [object, ExecutionAuthority, Callable[[float], None]], object
+        ]
         | None = None,
         sandbox_read_roots: tuple[str, ...] = (),
     ) -> tuple[EffectResult, object | None]:
-        self._validate_grant(grant)
+        self._validate_grant_for_dispatch(grant)
         command, executable_fd, policy_fd = self._validate_argv(grant, argv)
         effect = self.journal.get_effect(grant.run_id, grant.effect_id)
         if effect is None or effect.state is not EffectState.INTENT:
@@ -1446,16 +1485,6 @@ class CapabilityBroker:
                 grant.request_digest,
                 "already-dispatched",
                 "grant was already dispatched",
-            )
-        try:
-            self.journal.record_effect(
-                grant.effect_id, grant.fence, EffectState.STARTED, None
-            )
-        except JournalError as error:
-            self._deny(
-                grant.request_digest,
-                "fence-drift",
-                f"journal fence drift: {type(error).__name__}",
             )
         cwd = (
             grant.resource
@@ -1483,7 +1512,36 @@ class CapabilityBroker:
                 isolated_home,
                 sandbox_read_roots,
             )
+        authority: ExecutionAuthority | None = None
         try:
+            try:
+                if grant.capability in {"worker.analysis", "worker.implementation"}:
+                    authority = self.journal.begin_dispatch(
+                        run_id=grant.run_id,
+                        expected_revision=grant.run_revision,
+                        expected_state=grant.run_state,
+                        effect_id=grant.effect_id,
+                        worker_id=grant.worker_id,
+                        fence=grant.fence,
+                        grant_id=grant.grant_id,
+                        admission_expires_at=grant.expires_at,
+                        worker_timeout=timedelta(seconds=grant.timeout_seconds),
+                        termination_budget=timedelta(seconds=4),
+                        commit_budget=timedelta(
+                            seconds=WORKER_COMMIT_AUTHORITY_SECONDS
+                        ),
+                    )
+                else:
+                    self.journal.record_effect(
+                        grant.effect_id, grant.fence, EffectState.STARTED, None
+                    )
+            except JournalError as error:
+                self._deny(
+                    grant.request_digest,
+                    "fence-drift",
+                    f"journal fence drift: {type(error).__name__}",
+                    grant=grant,
+                )
             completed = self._process_runner(
                 execution_command,
                 input=stdin_text,
@@ -1581,8 +1639,12 @@ class CapabilityBroker:
                     prepared,
                 )
 
+            if authority is None:
+                raise RuntimeError("worker prepared result lacks execution authority")
+            self._validate_execution_authority(grant, authority)
+
             def validate_commit_authority(required_seconds: float) -> None:
-                self._validate_grant(grant, minimum_validity_seconds=required_seconds)
+                self._validate_grant_bindings(grant)
                 self.journal.record_effect(
                     grant.effect_id,
                     grant.fence,
@@ -1592,7 +1654,9 @@ class CapabilityBroker:
                 )
 
             try:
-                validation = result_committer(prepared, validate_commit_authority)
+                validation = result_committer(
+                    prepared, authority, validate_commit_authority
+                )
             except Exception:  # noqa: BLE001 - commit failures require reconciliation
                 return (
                     EffectResult(
