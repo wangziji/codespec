@@ -23,6 +23,7 @@ from urllib.parse import unquote, urlsplit
 
 from .canonical import canonical_digest
 from .journal import (
+    AdmissionExpired,
     EffectState,
     ExecutionAuthority,
     Journal,
@@ -1517,6 +1518,7 @@ class CapabilityBroker:
             child_environment = self._child_environment(
                 grant, isolated_home=isolated_home
             )
+            self._validate_grant_for_dispatch(grant)
             try:
                 if grant.capability in {"worker.analysis", "worker.implementation"}:
                     authority = self.journal.begin_dispatch(
@@ -1538,6 +1540,13 @@ class CapabilityBroker:
                     self.journal.record_effect(
                         grant.effect_id, grant.fence, EffectState.STARTED, None
                     )
+            except AdmissionExpired:
+                self._deny(
+                    grant.request_digest,
+                    "grant-expired",
+                    "grant expired",
+                    grant=grant,
+                )
             except JournalError as error:
                 self._deny(
                     grant.request_digest,

@@ -372,6 +372,206 @@ def test_environment_preflight_failure_leaves_worker_effect_intent(
     journal.close()
 
 
+def test_preflight_policy_drift_denies_before_worker_start(tmp_path: Path) -> None:
+    """Would fail if approval revocation could cross durable worker admission."""
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+    runner_calls: list[tuple[str, ...]] = []
+
+    def runner(
+        argv: tuple[str, ...], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        runner_calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(
+            policy_record(tmp_path, capability="worker.implementation")
+        ),
+        journal,
+        clock=clock,
+        process_runner=runner,
+    )
+    command = worker_argv(tmp_path)
+    grant = broker.authorize(
+        request(
+            tmp_path,
+            capability="worker.implementation",
+            requested_argv=command,
+        ),
+        context,
+    )
+    child_environment = broker._child_environment
+    revoked_policy = policy_record(tmp_path, capability="worker.implementation")
+    revoked_policy["policies"][0]["approval_digest"] = DIGEST_C
+
+    def revoke_during_preflight(*args: object, **kwargs: object) -> dict[str, str]:
+        environment = child_environment(*args, **kwargs)
+        broker.policy = CapabilityPolicy.from_mapping(revoked_policy)
+        return environment
+
+    broker._child_environment = revoke_during_preflight  # type: ignore[method-assign]
+
+    with pytest.raises(CapabilityDenied, match="capability policy changed"):
+        broker._dispatch(grant, command)
+
+    assert runner_calls == []
+    assert journal.get_effect("run-1", grant.effect_id).state is EffectState.INTENT
+    assert broker.decisions[-1].reason_code == "policy-drift"
+    journal.close()
+
+
+def test_preflight_resource_drift_denies_before_worker_start(tmp_path: Path) -> None:
+    """Would fail if resource replacement could cross durable worker admission."""
+    root = tmp_path / "approved"
+    root.mkdir()
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+    runner_calls: list[tuple[str, ...]] = []
+
+    def runner(
+        argv: tuple[str, ...], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        runner_calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(
+            policy_record(root, capability="worker.implementation")
+        ),
+        journal,
+        clock=clock,
+        process_runner=runner,
+    )
+    command = worker_argv(root)
+    grant = broker.authorize(
+        request(
+            root,
+            capability="worker.implementation",
+            requested_argv=command,
+        ),
+        context,
+    )
+    child_environment = broker._child_environment
+
+    def replace_resource_during_preflight(
+        *args: object, **kwargs: object
+    ) -> dict[str, str]:
+        environment = child_environment(*args, **kwargs)
+        root.rmdir()
+        root.symlink_to(replacement, target_is_directory=True)
+        return environment
+
+    broker._child_environment = (  # type: ignore[method-assign]
+        replace_resource_during_preflight
+    )
+
+    with pytest.raises(CapabilityDenied, match="resource drifted"):
+        broker._dispatch(grant, command)
+
+    assert runner_calls == []
+    assert journal.get_effect("run-1", grant.effect_id).state is EffectState.INTENT
+    assert broker.decisions[-1].reason_code == "resource-drift"
+    journal.close()
+
+
+def test_preflight_expiry_records_grant_expired(tmp_path: Path) -> None:
+    """Would fail if journal admission expiry were audited as a fence conflict."""
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+    runner_calls: list[tuple[str, ...]] = []
+
+    def runner(
+        argv: tuple[str, ...], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        runner_calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(
+            policy_record(tmp_path, capability="worker.implementation")
+        ),
+        journal,
+        clock=clock,
+        process_runner=runner,
+    )
+    command = worker_argv(tmp_path)
+    grant = broker.authorize(
+        request(
+            tmp_path,
+            capability="worker.implementation",
+            requested_argv=command,
+        ),
+        context,
+    )
+    child_environment = broker._child_environment
+
+    def expire_during_preflight(*args: object, **kwargs: object) -> dict[str, str]:
+        environment = child_environment(*args, **kwargs)
+        clock.advance(grant.expires_at - clock.now)
+        return environment
+
+    broker._child_environment = expire_during_preflight  # type: ignore[method-assign]
+
+    with pytest.raises(CapabilityDenied, match="grant expired"):
+        broker._dispatch(grant, command)
+
+    assert runner_calls == []
+    assert journal.get_effect("run-1", grant.effect_id).state is EffectState.INTENT
+    assert broker.decisions[-1].reason_code == "grant-expired"
+    journal.close()
+
+
+def test_journal_admission_expiry_is_not_recorded_as_fence_drift(
+    tmp_path: Path,
+) -> None:
+    """Would fail if expiry after final validation used fence-drift telemetry."""
+    clock = MutableClock()
+    journal, context = seed(tmp_path, clock)
+    runner_calls: list[tuple[str, ...]] = []
+
+    def runner(
+        argv: tuple[str, ...], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        runner_calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    broker = CapabilityBroker(
+        CapabilityPolicy.from_mapping(
+            policy_record(tmp_path, capability="worker.implementation")
+        ),
+        journal,
+        clock=clock,
+        process_runner=runner,
+    )
+    command = worker_argv(tmp_path)
+    grant = broker.authorize(
+        request(
+            tmp_path,
+            capability="worker.implementation",
+            requested_argv=command,
+        ),
+        context,
+    )
+    begin_dispatch = journal.begin_dispatch
+
+    def expire_before_durable_start(**kwargs: object) -> object:
+        clock.advance(grant.expires_at - clock.now)
+        return begin_dispatch(**kwargs)
+
+    journal.begin_dispatch = expire_before_durable_start  # type: ignore[method-assign]
+
+    with pytest.raises(CapabilityDenied, match="grant expired"):
+        broker._dispatch(grant, command)
+
+    assert runner_calls == []
+    assert journal.get_effect("run-1", grant.effect_id).state is EffectState.INTENT
+    assert broker.decisions[-1].reason_code == "grant-expired"
+    journal.close()
+
+
 def test_approval_policy_drift_after_started_keeps_prepared_without_mutation(
     tmp_path: Path,
 ) -> None:
