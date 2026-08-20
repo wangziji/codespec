@@ -5,15 +5,16 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import pytest
-
 import codex_contract_delivery.journal as journal_module
+import pytest
 from codex_contract_delivery.journal import (
+    AdmissionExpired,
     ClockRollback,
     DatabaseBusy,
     EffectConflict,
     EffectIntent,
     EffectState,
+    ExecutionAuthority,
     Journal,
     JournalError,
     JournalStorageError,
@@ -89,6 +90,19 @@ def observed_watermark(path: Path) -> str | None:
         return connection.execute(
             "SELECT last_observed_time FROM journal_metadata WHERE singleton = 1"
         ).fetchone()[0]
+    finally:
+        connection.close()
+
+
+def lease_row(path: Path) -> tuple[str, int, str]:
+    connection = sqlite3.connect(path)
+    try:
+        row = connection.execute(
+            "SELECT worker_id, fence, expires_at FROM leases "
+            "WHERE run_id = 'run-1' AND effect_id = 'deploy-1'"
+        ).fetchone()
+        assert row is not None
+        return row
     finally:
         connection.close()
 
@@ -1584,3 +1598,301 @@ def test_invalid_run_transition_does_not_append_event(journal: Journal) -> None:
 
     assert journal.get_run("run-1").state is RunState.DISCOVERY
     assert len(journal.list_events("run-1")) == 1
+
+
+def test_begin_dispatch_reanchors_lease_from_actual_start(
+    journal: Journal, clock: MutableClock
+) -> None:
+    """Would fail if runtime authority were anchored before durable dispatch."""
+    seed_effect(journal)
+    reservation = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(seconds=30)
+    )
+    admission_expires_at = clock.now + timedelta(seconds=30)
+    clock.advance(timedelta(seconds=5))
+
+    authority = journal.begin_dispatch(
+        run_id="run-1",
+        expected_revision=1,
+        expected_state=RunState.DISCOVERY,
+        effect_id="deploy-1",
+        worker_id="worker-a",
+        fence=reservation.fence,
+        grant_id="a" * 64,
+        admission_expires_at=admission_expires_at,
+        worker_timeout=timedelta(seconds=30),
+        termination_budget=timedelta(seconds=4),
+        commit_budget=timedelta(seconds=29),
+    )
+
+    assert isinstance(authority, ExecutionAuthority)
+    assert authority.started_at == datetime(2026, 8, 11, 12, 0, 5, tzinfo=UTC)
+    assert authority.worker_deadline == datetime(2026, 8, 11, 12, 0, 35, tzinfo=UTC)
+    assert authority.commit_deadline == datetime(2026, 8, 11, 12, 1, 8, tzinfo=UTC)
+    assert authority.lease_expires_at == authority.commit_deadline
+    assert authority.fence == reservation.fence
+    assert authority.grant_id == "a" * 64
+    assert authority.verify_digest()
+    effect = journal.get_effect("run-1", "deploy-1")
+    assert effect is not None
+    assert effect.state is EffectState.STARTED
+
+
+def test_begin_dispatch_expired_admission_preserves_intent(
+    journal: Journal, clock: MutableClock
+) -> None:
+    """Would fail if expired admission crossed the durable dispatch boundary."""
+    seed_effect(journal)
+    reservation = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(seconds=30)
+    )
+    admission_expires_at = clock.now + timedelta(seconds=30)
+    clock.advance(timedelta(seconds=30))
+
+    with pytest.raises(AdmissionExpired):
+        journal.begin_dispatch(
+            run_id="run-1",
+            expected_revision=1,
+            expected_state=RunState.DISCOVERY,
+            effect_id="deploy-1",
+            worker_id="worker-a",
+            fence=reservation.fence,
+            grant_id="a" * 64,
+            admission_expires_at=admission_expires_at,
+            worker_timeout=timedelta(seconds=30),
+            termination_budget=timedelta(seconds=4),
+            commit_budget=timedelta(seconds=29),
+        )
+
+    effect = journal.get_effect("run-1", "deploy-1")
+    assert effect is not None
+    assert effect.state is EffectState.INTENT
+    assert len(journal.list_events("run-1")) == 1
+
+
+@pytest.mark.parametrize(
+    ("worker_id", "fence_offset"),
+    [("worker-b", 0), ("worker-a", 1)],
+)
+def test_begin_dispatch_wrong_owner_or_fence_preserves_reservation(
+    journal: Journal,
+    journal_path: Path,
+    clock: MutableClock,
+    worker_id: str,
+    fence_offset: int,
+) -> None:
+    """Would fail if a mismatched reservation could re-anchor an attempt lease."""
+    seed_effect(journal)
+    reservation = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(seconds=30)
+    )
+    original_lease = lease_row(journal_path)
+    admission_expires_at = clock.now + timedelta(seconds=30)
+
+    with pytest.raises(StaleFence):
+        journal.begin_dispatch(
+            run_id="run-1",
+            expected_revision=1,
+            expected_state=RunState.DISCOVERY,
+            effect_id="deploy-1",
+            worker_id=worker_id,
+            fence=reservation.fence + fence_offset,
+            grant_id="a" * 64,
+            admission_expires_at=admission_expires_at,
+            worker_timeout=timedelta(seconds=30),
+            termination_budget=timedelta(seconds=4),
+            commit_budget=timedelta(seconds=29),
+        )
+
+    effect = journal.get_effect("run-1", "deploy-1")
+    assert effect is not None
+    assert effect.state is EffectState.INTENT
+    assert lease_row(journal_path) == original_lease
+
+
+def test_begin_dispatch_replay_requires_reconciliation(
+    journal: Journal, clock: MutableClock
+) -> None:
+    """Would fail if a durable STARTED effect could launch a second worker."""
+    seed_effect(journal)
+    reservation = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(seconds=30)
+    )
+    admission_expires_at = clock.now + timedelta(seconds=30)
+    arguments = {
+        "run_id": "run-1",
+        "expected_revision": 1,
+        "expected_state": RunState.DISCOVERY,
+        "effect_id": "deploy-1",
+        "worker_id": "worker-a",
+        "fence": reservation.fence,
+        "grant_id": "a" * 64,
+        "admission_expires_at": admission_expires_at,
+        "worker_timeout": timedelta(seconds=30),
+        "termination_budget": timedelta(seconds=4),
+        "commit_budget": timedelta(seconds=29),
+    }
+
+    journal.begin_dispatch(**arguments)
+
+    with pytest.raises(ReconciliationRequired):
+        journal.begin_dispatch(**arguments)
+
+    effect = journal.get_effect("run-1", "deploy-1")
+    assert effect is not None
+    assert effect.state is EffectState.STARTED
+
+
+@pytest.mark.parametrize(
+    ("expected_revision", "expected_state"),
+    [(2, RunState.DISCOVERY), (1, RunState.REQUIREMENTS)],
+)
+def test_begin_dispatch_run_revision_and_state_are_atomic_guards(
+    journal: Journal,
+    clock: MutableClock,
+    expected_revision: int,
+    expected_state: RunState,
+) -> None:
+    """Would fail if dispatch accepted stale run lifecycle authority."""
+    seed_effect(journal)
+    reservation = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(seconds=30)
+    )
+    admission_expires_at = clock.now + timedelta(seconds=30)
+
+    with pytest.raises(RevisionConflict):
+        journal.begin_dispatch(
+            run_id="run-1",
+            expected_revision=expected_revision,
+            expected_state=expected_state,
+            effect_id="deploy-1",
+            worker_id="worker-a",
+            fence=reservation.fence,
+            grant_id="a" * 64,
+            admission_expires_at=admission_expires_at,
+            worker_timeout=timedelta(seconds=30),
+            termination_budget=timedelta(seconds=4),
+            commit_budget=timedelta(seconds=29),
+        )
+
+    effect = journal.get_effect("run-1", "deploy-1")
+    assert effect is not None
+    assert effect.state is EffectState.INTENT
+
+
+def test_begin_dispatch_clock_rollback_preserves_intent(
+    journal: Journal, clock: MutableClock
+) -> None:
+    """Would fail if rollback could revive dispatch authority."""
+    seed_effect(journal)
+    reservation = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(seconds=30)
+    )
+    admission_expires_at = clock.now + timedelta(seconds=30)
+    clock.now = datetime(2026, 8, 11, 11, 59, 59, tzinfo=UTC)
+
+    with pytest.raises(ClockRollback):
+        journal.begin_dispatch(
+            run_id="run-1",
+            expected_revision=1,
+            expected_state=RunState.DISCOVERY,
+            effect_id="deploy-1",
+            worker_id="worker-a",
+            fence=reservation.fence,
+            grant_id="a" * 64,
+            admission_expires_at=admission_expires_at,
+            worker_timeout=timedelta(seconds=30),
+            termination_budget=timedelta(seconds=4),
+            commit_budget=timedelta(seconds=29),
+        )
+
+    effect = journal.get_effect("run-1", "deploy-1")
+    assert effect is not None
+    assert effect.state is EffectState.INTENT
+
+
+def test_begin_dispatch_lease_update_failure_rolls_back_started(
+    journal: Journal, journal_path: Path, clock: MutableClock
+) -> None:
+    """Would fail if a lease write failure left STARTED committed alone."""
+    seed_effect(journal)
+    reservation = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(seconds=30)
+    )
+    original_lease = lease_row(journal_path)
+    admission_expires_at = clock.now + timedelta(seconds=30)
+    journal._connection.execute(
+        "CREATE TRIGGER test_same_fence_lease_update_failure "
+        "BEFORE UPDATE ON leases "
+        "WHEN NEW.fence = OLD.fence AND NEW.expires_at != OLD.expires_at "
+        "BEGIN SELECT RAISE(ABORT, 'test lease expiry failure'); END"
+    )
+
+    try:
+        with pytest.raises(JournalStorageError):
+            journal.begin_dispatch(
+                run_id="run-1",
+                expected_revision=1,
+                expected_state=RunState.DISCOVERY,
+                effect_id="deploy-1",
+                worker_id="worker-a",
+                fence=reservation.fence,
+                grant_id="a" * 64,
+                admission_expires_at=admission_expires_at,
+                worker_timeout=timedelta(seconds=30),
+                termination_budget=timedelta(seconds=4),
+                commit_budget=timedelta(seconds=29),
+            )
+    finally:
+        journal._connection.execute("DROP TRIGGER test_same_fence_lease_update_failure")
+
+    effect = journal.get_effect("run-1", "deploy-1")
+    assert effect is not None
+    assert effect.state is EffectState.INTENT
+    assert lease_row(journal_path) == original_lease
+
+
+def test_begin_prepared_commit_anchors_only_commit_budget(
+    journal: Journal, journal_path: Path, clock: MutableClock
+) -> None:
+    """Would fail if adopting a stage received another worker execution window."""
+    seed_effect(journal)
+    first = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(seconds=1)
+    )
+    prior = "effect-stage://sha256/" + "a" * 64
+    adopted = "effect-stage://sha256/" + "b" * 64
+    journal.record_effect("deploy-1", first.fence, EffectState.STARTED, None)
+    journal.record_effect("deploy-1", first.fence, EffectState.PREPARED, prior)
+    journal.record_reconciliation(
+        "deploy-1",
+        first.fence,
+        ReconciliationOutcome.OBSERVED_ABSENT,
+        "probe://host-before-manifest",
+    )
+    clock.advance(timedelta(seconds=2))
+    second = journal.acquire_attempt(
+        "run-1", "deploy-1", "worker-a", timedelta(seconds=30)
+    )
+    journal.adopt_prepared("deploy-1", second.fence, prior, adopted)
+    admission_expires_at = clock.now + timedelta(seconds=30)
+
+    authority = journal.begin_prepared_commit(
+        run_id="run-1",
+        expected_revision=1,
+        expected_state=RunState.DISCOVERY,
+        effect_id="deploy-1",
+        worker_id="worker-a",
+        fence=second.fence,
+        grant_id="b" * 64,
+        admission_expires_at=admission_expires_at,
+        expected_evidence_ref=adopted,
+        commit_budget=timedelta(seconds=29),
+    )
+
+    effect = journal.get_effect("run-1", "deploy-1")
+    assert effect is not None
+    assert effect.state is EffectState.PREPARED
+    assert authority.worker_deadline == authority.started_at
+    assert authority.commit_deadline == authority.started_at + timedelta(seconds=29)
+    assert lease_row(journal_path)[1] == second.fence

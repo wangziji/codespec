@@ -14,6 +14,7 @@ from enum import Enum
 from pathlib import Path
 
 from .approvals import freeze_value
+from .canonical import canonical_digest
 from .state_machine import InvalidTransition, RunEvent, RunState, StateMachine
 
 
@@ -159,6 +160,40 @@ class Lease:
             raise ReconciliationRequired(
                 "effect was already started; reconcile its external outcome"
             )
+
+
+class AdmissionExpired(JournalError):
+    """A grant expired before its attempt durably started."""
+
+
+@dataclass(frozen=True)
+class ExecutionAuthority:
+    grant_id: str
+    run_id: str
+    effect_id: str
+    worker_id: str
+    fence: int
+    started_at: datetime
+    worker_deadline: datetime
+    commit_deadline: datetime
+    lease_expires_at: datetime
+    authority_digest: str
+
+    def _content(self) -> dict[str, object]:
+        return {
+            "grant_id": self.grant_id,
+            "run_id": self.run_id,
+            "effect_id": self.effect_id,
+            "worker_id": self.worker_id,
+            "fence": self.fence,
+            "started_at": _format_time(self.started_at),
+            "worker_deadline": _format_time(self.worker_deadline),
+            "commit_deadline": _format_time(self.commit_deadline),
+            "lease_expires_at": _format_time(self.lease_expires_at),
+        }
+
+    def verify_digest(self) -> bool:
+        return self.authority_digest == canonical_digest(self._content())
 
 
 _STATE_VALUES = ", ".join(f"'{state.value}'" for state in RunState)
@@ -906,6 +941,210 @@ class Journal:
                 effect_state is EffectState.INTENT,
             )
 
+    def begin_dispatch(
+        self,
+        *,
+        run_id: str,
+        expected_revision: int,
+        expected_state: RunState,
+        effect_id: str,
+        worker_id: str,
+        fence: int,
+        grant_id: str,
+        admission_expires_at: datetime,
+        worker_timeout: timedelta,
+        termination_budget: timedelta,
+        commit_budget: timedelta,
+    ) -> ExecutionAuthority:
+        """Atomically record STARTED and re-anchor the current attempt lease."""
+        expected_state, admission_expires_at = _validate_authority_inputs(
+            run_id=run_id,
+            expected_revision=expected_revision,
+            expected_state=expected_state,
+            effect_id=effect_id,
+            worker_id=worker_id,
+            fence=fence,
+            grant_id=grant_id,
+            admission_expires_at=admission_expires_at,
+            worker_timeout=worker_timeout,
+            termination_budget=termination_budget,
+            commit_budget=commit_budget,
+        )
+        with self._authority_transaction() as now:
+            row = self._authority_row(run_id, effect_id)
+            self._require_current_run(row, expected_revision, expected_state)
+            if row["effect_state"] is None:
+                raise EffectNotFound(
+                    f"effect {effect_id} does not exist for run {run_id}"
+                )
+            if EffectState(row["effect_state"]) is not EffectState.INTENT:
+                raise ReconciliationRequired(
+                    "effect was already started; reconcile its external outcome"
+                )
+            if now >= admission_expires_at:
+                raise AdmissionExpired("grant expired before durable dispatch")
+            self._require_current_reservation(row, worker_id, fence, now, effect_id)
+
+            worker_deadline = now + worker_timeout
+            commit_deadline = worker_deadline + termination_budget + commit_budget
+            updated = self._connection.execute(
+                "UPDATE effects SET state = ?, updated_at = ? "
+                "WHERE run_id = ? AND effect_id = ? AND state = ?",
+                (
+                    EffectState.STARTED.value,
+                    _format_time(now),
+                    run_id,
+                    effect_id,
+                    EffectState.INTENT.value,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ReconciliationRequired(
+                    "effect was already started; reconcile its external outcome"
+                )
+            lease_updated = self._connection.execute(
+                "UPDATE leases SET expires_at = ? "
+                "WHERE run_id = ? AND effect_id = ? AND worker_id = ? AND fence = ? "
+                "AND expires_at > ?",
+                (
+                    _format_time(commit_deadline),
+                    run_id,
+                    effect_id,
+                    worker_id,
+                    fence,
+                    _format_time(now),
+                ),
+            )
+            if lease_updated.rowcount != 1:
+                raise StaleFence(f"fence {fence} is not current for effect {effect_id}")
+            return _build_execution_authority(
+                grant_id=grant_id,
+                run_id=run_id,
+                effect_id=effect_id,
+                worker_id=worker_id,
+                fence=fence,
+                started_at=now,
+                worker_deadline=worker_deadline,
+                commit_deadline=commit_deadline,
+                lease_expires_at=commit_deadline,
+            )
+
+    def begin_prepared_commit(
+        self,
+        *,
+        run_id: str,
+        expected_revision: int,
+        expected_state: RunState,
+        effect_id: str,
+        worker_id: str,
+        fence: int,
+        grant_id: str,
+        admission_expires_at: datetime,
+        expected_evidence_ref: str,
+        commit_budget: timedelta,
+    ) -> ExecutionAuthority:
+        """Atomically re-anchor an adopted prepared stage for bounded commit."""
+        expected_state, admission_expires_at = _validate_authority_inputs(
+            run_id=run_id,
+            expected_revision=expected_revision,
+            expected_state=expected_state,
+            effect_id=effect_id,
+            worker_id=worker_id,
+            fence=fence,
+            grant_id=grant_id,
+            admission_expires_at=admission_expires_at,
+            worker_timeout=None,
+            termination_budget=None,
+            commit_budget=commit_budget,
+        )
+        _require_identifier("expected_evidence_ref", expected_evidence_ref)
+        with self._authority_transaction() as now:
+            row = self._authority_row(run_id, effect_id)
+            self._require_current_run(row, expected_revision, expected_state)
+            if row["effect_state"] is None:
+                raise EffectNotFound(
+                    f"effect {effect_id} does not exist for run {run_id}"
+                )
+            if EffectState(row["effect_state"]) is not EffectState.PREPARED:
+                raise ReconciliationRequired(
+                    "effect is not prepared for bounded commit reconciliation"
+                )
+            if row["evidence_ref"] != expected_evidence_ref:
+                raise EffectConflict(
+                    "prepared effect evidence conflicts with authority"
+                )
+            if now >= admission_expires_at:
+                raise AdmissionExpired("grant expired before durable prepared commit")
+            self._require_current_reservation(row, worker_id, fence, now, effect_id)
+
+            commit_deadline = now + commit_budget
+            lease_updated = self._connection.execute(
+                "UPDATE leases SET expires_at = ? "
+                "WHERE run_id = ? AND effect_id = ? AND worker_id = ? AND fence = ? "
+                "AND expires_at > ?",
+                (
+                    _format_time(commit_deadline),
+                    run_id,
+                    effect_id,
+                    worker_id,
+                    fence,
+                    _format_time(now),
+                ),
+            )
+            if lease_updated.rowcount != 1:
+                raise StaleFence(f"fence {fence} is not current for effect {effect_id}")
+            return _build_execution_authority(
+                grant_id=grant_id,
+                run_id=run_id,
+                effect_id=effect_id,
+                worker_id=worker_id,
+                fence=fence,
+                started_at=now,
+                worker_deadline=now,
+                commit_deadline=commit_deadline,
+                lease_expires_at=commit_deadline,
+            )
+
+    def _authority_row(self, run_id: str, effect_id: str) -> sqlite3.Row | None:
+        return self._connection.execute(
+            "SELECT r.revision, r.state AS run_state, e.state AS effect_state, "
+            "e.evidence_ref, l.worker_id, l.fence, l.expires_at "
+            "FROM runs r LEFT JOIN effects e "
+            "ON e.run_id = r.run_id AND e.effect_id = ? "
+            "LEFT JOIN leases l ON l.run_id = e.run_id AND l.effect_id = e.effect_id "
+            "WHERE r.run_id = ?",
+            (effect_id, run_id),
+        ).fetchone()
+
+    @staticmethod
+    def _require_current_run(
+        row: sqlite3.Row | None,
+        expected_revision: int,
+        expected_state: RunState,
+    ) -> None:
+        if (
+            row is None
+            or row["revision"] != expected_revision
+            or row["run_state"] != expected_state.value
+        ):
+            raise RevisionConflict("run revision or state changed before dispatch")
+
+    @staticmethod
+    def _require_current_reservation(
+        row: sqlite3.Row,
+        worker_id: str,
+        fence: int,
+        now: datetime,
+        effect_id: str,
+    ) -> None:
+        if (
+            row["worker_id"] != worker_id
+            or row["fence"] != fence
+            or row["expires_at"] is None
+            or _parse_time(row["expires_at"]) <= now
+        ):
+            raise StaleFence(f"fence {fence} is not current for effect {effect_id}")
+
     def record_effect(
         self,
         effect_id: str,
@@ -1297,6 +1536,97 @@ def _format_time(value: datetime) -> str:
 
 def _parse_time(value: str) -> datetime:
     return datetime.fromisoformat(value).astimezone(UTC)
+
+
+def _build_execution_authority(
+    *,
+    grant_id: str,
+    run_id: str,
+    effect_id: str,
+    worker_id: str,
+    fence: int,
+    started_at: datetime,
+    worker_deadline: datetime,
+    commit_deadline: datetime,
+    lease_expires_at: datetime,
+) -> ExecutionAuthority:
+    content = {
+        "grant_id": grant_id,
+        "run_id": run_id,
+        "effect_id": effect_id,
+        "worker_id": worker_id,
+        "fence": fence,
+        "started_at": _format_time(started_at),
+        "worker_deadline": _format_time(worker_deadline),
+        "commit_deadline": _format_time(commit_deadline),
+        "lease_expires_at": _format_time(lease_expires_at),
+    }
+    return ExecutionAuthority(
+        grant_id=grant_id,
+        run_id=run_id,
+        effect_id=effect_id,
+        worker_id=worker_id,
+        fence=fence,
+        started_at=started_at,
+        worker_deadline=worker_deadline,
+        commit_deadline=commit_deadline,
+        lease_expires_at=lease_expires_at,
+        authority_digest=canonical_digest(content),
+    )
+
+
+def _validate_authority_inputs(
+    *,
+    run_id: str,
+    expected_revision: int,
+    expected_state: RunState,
+    effect_id: str,
+    worker_id: str,
+    fence: int,
+    grant_id: str,
+    admission_expires_at: datetime,
+    worker_timeout: timedelta | None,
+    termination_budget: timedelta | None,
+    commit_budget: timedelta,
+) -> tuple[RunState, datetime]:
+    for name, value in (
+        ("run_id", run_id),
+        ("effect_id", effect_id),
+        ("worker_id", worker_id),
+        ("grant_id", grant_id),
+    ):
+        _require_identifier(name, value)
+    if (
+        not isinstance(expected_revision, int)
+        or isinstance(expected_revision, bool)
+        or expected_revision < 0
+    ):
+        raise ValueError("expected_revision must be a non-negative integer")
+    try:
+        normalized_state = RunState(expected_state)
+    except (TypeError, ValueError) as error:
+        raise ValueError("expected_state must be a run state") from error
+    if not isinstance(fence, int) or isinstance(fence, bool) or fence <= 0:
+        raise StaleFence("fence must be a positive integer")
+    if (
+        not isinstance(admission_expires_at, datetime)
+        or admission_expires_at.tzinfo is None
+        or admission_expires_at.utcoffset() is None
+    ):
+        raise ValueError("admission_expires_at must be a timezone-aware datetime")
+    if worker_timeout is None:
+        if termination_budget is not None:
+            raise ValueError("termination_budget requires worker_timeout")
+    else:
+        if not isinstance(worker_timeout, timedelta) or worker_timeout <= timedelta(0):
+            raise ValueError("worker_timeout must be a positive timedelta")
+        if not isinstance(
+            termination_budget, timedelta
+        ) or termination_budget < timedelta(0):
+            raise ValueError("termination_budget must be a non-negative timedelta")
+    if not isinstance(commit_budget, timedelta) or commit_budget < timedelta(0):
+        raise ValueError("commit_budget must be a non-negative timedelta")
+    return normalized_state, admission_expires_at.astimezone(UTC)
 
 
 def _require_identifier(name: str, value: object) -> None:
