@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+  "required": ["schema_version", "module_id", "business_capability", "data_owners", "interfaces", "submodules"],
+  "properties": {
+    "schema_version": {"const": "1.0"}, "module_id": {"type": "string", "minLength": 1}, "business_capability": {"type": "string", "minLength": 1}, "data_owners": {"type": "array", "minItems": 1}, "interfaces": {"type": "array", "minItems": 1},
+    "submodules": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["module_id", "test_boundary", "context_budget"], "properties": {"module_id": {"type": "string", "minLength": 1}, "test_boundary": {"type": "string", "minLength": 1}, "context_budget": {"type": "integer", "minimum": 1}}, "additionalProperties": false}}
+  }, "additionalProperties": false
+}

@@ -1,0 +1,25 @@
+schema_version: "1.0"
+ci:
+  provider: "<mysql|postgresql|redis|kafka|nacos|s3|kubernetes|filesystem|saas>"
+  kind: "<same-as-provider>"
+  account_or_host: "<real-account-or-host>"
+  resource_id: "<real-writable-resource-id>"
+  canonical_locator: "<provider>://<real-host>/<real-resource-path>"
+  identity_digest: "sha256:<64-lowercase-hex-from-identity-probe>"
+  writable: true
+test:
+  provider: "<mysql|postgresql|redis|kafka|nacos|s3|kubernetes|filesystem|saas>"
+  kind: "<same-as-provider>"
+  account_or_host: "<real-account-or-host>"
+  resource_id: "<real-writable-resource-id>"
+  canonical_locator: "<provider>://<real-host>/<real-resource-path>"
+  identity_digest: "sha256:<64-lowercase-hex-from-identity-probe>"
+  writable: true
+prod:
+  provider: "<mysql|postgresql|redis|kafka|nacos|s3|kubernetes|filesystem|saas>"
+  kind: "<same-as-provider>"
+  account_or_host: "<real-account-or-host>"
+  resource_id: "<real-writable-resource-id>"
+  canonical_locator: "<provider>://<real-host>/<real-resource-path>"
+  identity_digest: "sha256:<64-lowercase-hex-from-identity-probe>"
+  writable: true

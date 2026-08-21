@@ -1,2 +1,6 @@
 .DS_Store
 .codegraph/
+.worktrees/
+.superpowers/sdd/
+.venv/
+__pycache__/

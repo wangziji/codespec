@@ -1,0 +1,11 @@
+schema_version: "1.0"
+delivery_id: "<delivery-id>"
+type: feature
+base_revision: "<git-revision>"
+workflow_release_digest: "<sha256>"
+owner_refs: []
+delta_operations: []
+cross_layer_impacts: []
+environment_obligations: []
+verification: []
+completion_conditions: []
