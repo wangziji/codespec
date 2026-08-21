@@ -15,7 +15,12 @@ from .models import Finding
 def freeze_value(value: object) -> object:
     """Recursively freeze contract payloads before they cross a public boundary."""
     if isinstance(value, Mapping):
-        return MappingProxyType({str(key): freeze_value(item) for key, item in value.items()})
+        frozen: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("mapping keys must be strings")
+            frozen[key] = freeze_value(item)
+        return MappingProxyType(frozen)
     if isinstance(value, list | tuple):
         return tuple(freeze_value(item) for item in value)
     if isinstance(value, set | frozenset):

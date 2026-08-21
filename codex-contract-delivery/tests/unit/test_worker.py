@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -40,7 +41,7 @@ def initialize_primary_git(root: Path) -> None:
 
 def initialize_git(root: Path) -> None:
     if root.exists():
-        root.rmdir()
+        shutil.rmtree(root)
     source = root.parent / f"{root.name}-source"
     source.mkdir()
     initialize_primary_git(source)
@@ -58,6 +59,18 @@ def initialize_git(root: Path) -> None:
         ),
         check=True,
     )
+
+
+def test_initialize_git_replaces_nonempty_worktree_root(tmp_path: Path) -> None:
+    """Would fail if stale test files prevented linked-worktree fixture setup."""
+    root = tmp_path / "worktree"
+    root.mkdir()
+    (root / "leftover.txt").write_text("stale\n", encoding="utf-8")
+
+    initialize_git(root)
+
+    assert (root / ".git").is_file()
+    assert not (root / "leftover.txt").exists()
 
 
 def authorized(

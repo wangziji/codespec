@@ -313,10 +313,19 @@ def execute_guest(
         )
     finally:
         if process is not None and process.poll() is None:
-            _terminate_process_group(process.pid)
-            process.wait(timeout=_KILL_GRACE_SECONDS)
-        shutil.rmtree(workspace)
-        state_path.unlink(missing_ok=True)
+            try:
+                _terminate_process_group(process.pid)
+                process.wait(timeout=_KILL_GRACE_SECONDS)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        try:
+            shutil.rmtree(workspace)
+        except OSError:
+            pass
+        try:
+            state_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         try:
             control_dir.rmdir()
         except OSError:

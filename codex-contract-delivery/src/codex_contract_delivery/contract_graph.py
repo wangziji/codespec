@@ -123,20 +123,15 @@ class ContractGraph:
         return ".codex-delivery/generated" in path.relative_to(root).as_posix()
 
     def _find_baseline(self, root: Path, registry: SchemaRegistry) -> tuple[Path, Mapping[str, object]]:
-        candidates: list[tuple[Path, Mapping[str, object]]] = []
-        for path in root.rglob("*.yaml"):
-            path = self._safe_input_path(root, path)
-            if self._is_generated(root, path):
-                continue
-            try:
-                value = load_yaml(path)
-            except (OSError, ContractParseError):
-                continue
-            if registry.validate("project-baseline", value) == ():
-                candidates.append((path, value))
-        if len(candidates) != 1:
+        path = self._safe_input_path(root, root / "contracts" / "project-baseline.yaml")
+        try:
+            value = load_yaml(path)
+        except (OSError, ContractParseError):
             raise ContractResolutionError((Finding("CDD-GRAPH-BASELINE-COUNT", "Exactly one project baseline is required.", ""),))
-        return candidates[0]
+        if registry.validate("project-baseline", value) != ():
+            raise ContractResolutionError((Finding("CDD-GRAPH-BASELINE-COUNT", "Exactly one project baseline is required.", ""),))
+        assert isinstance(value, Mapping)
+        return path, value
 
     @staticmethod
     def _owner_refs(delivery: Mapping[str, object]) -> tuple[OwnerRef, ...]:

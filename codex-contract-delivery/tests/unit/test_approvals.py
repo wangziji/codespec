@@ -10,6 +10,7 @@ from codex_contract_delivery.approvals import (
     ChangeLevel,
     ContractNode,
     classify_change,
+    freeze_value,
 )
 from codex_contract_delivery.canonical import load_yaml
 
@@ -107,6 +108,12 @@ def test_contract_node_does_not_expose_mutable_nested_value() -> None:
 
     with pytest.raises(TypeError):
         node.value["nested"]["items"][0] = "changed"  # type: ignore[index]
+
+
+def test_freeze_value_rejects_non_string_mapping_keys() -> None:
+    """Would fail if distinct mapping keys could silently collapse at a public boundary."""
+    with pytest.raises(TypeError, match="mapping keys must be strings"):
+        freeze_value({1: "numeric", "1": "text"})
 
 
 @pytest.mark.parametrize(

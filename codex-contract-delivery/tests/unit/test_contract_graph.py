@@ -55,6 +55,22 @@ def test_effective_contract_explains_every_constraint(valid_project: Path) -> No
     assert effective.digest == canonical_digest(effective.nodes)
 
 
+def test_graph_uses_canonical_contracts_baseline_location(valid_project: Path) -> None:
+    """Would fail if unrelated YAML could change authoritative baseline discovery."""
+    unrelated = valid_project / "scratch"
+    unrelated.mkdir()
+    (unrelated / "project-baseline.yaml").write_text(
+        (valid_project / "contracts" / "project-baseline.yaml").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+
+    effective = ContractGraph().resolve(valid_project, "D-001")
+
+    assert effective.origin_of("delta:api-login") == "deliveries/D-001/contract.yaml"
+
+
 def test_graph_rejects_conflicting_delta_values(valid_project: Path) -> None:
     """Would fail if a later delta silently won over an incompatible earlier value."""
     contract = valid_project / "deliveries" / "D-001" / "contract.yaml"

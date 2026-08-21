@@ -16,6 +16,7 @@ from hashlib import sha256
 from pathlib import Path
 
 import pytest
+from codex_contract_delivery import vm_guest
 from codex_contract_delivery.capabilities import (
     CapabilityBroker,
     CapabilityPolicy,
@@ -689,6 +690,110 @@ def test_guest_execution_uses_self_contained_git_and_exports_then_cleans_workspa
     assert b"approved.txt" in base64.b64decode(record["patch_b64"])
     assert base64.b64decode(record["name_status_b64"]) == b"A\x00approved.txt\x00"
     assert list(workspace_base.iterdir()) == []
+
+
+def test_guest_cleanup_removes_control_state_when_workspace_removal_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Would fail if a workspace cleanup error left stale guest control state."""
+    source = tmp_path / "readonly-source"
+    source.mkdir()
+    initialize_git(source)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    codex = fake_codex(tmp_path / "codex")
+    workspace_base = tmp_path / "guest-workspaces"
+    workspace_base.mkdir()
+    request, snapshot = guest_request(source)
+
+    def refuse_workspace_removal(path: Path, *args: object, **kwargs: object) -> None:
+        raise OSError(f"cannot remove {path}")
+
+    monkeypatch.setattr(vm_guest.shutil, "rmtree", refuse_workspace_removal)
+
+    completed = execute_guest(
+        workspace_base=workspace_base,
+        kind="implementation",
+        expected_fingerprint="a" * 64,
+        expected_snapshot_digest=snapshot.digest,
+        codex_executable=codex,
+        guest_codex_home=codex_home,
+        request_text=request,
+    )
+
+    assert completed.returncode == 0
+    assert not (workspace_base / ".cdd-control").exists()
+
+
+def test_guest_cleanup_continues_after_killed_process_wait_times_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Would fail if a hung reap masked cleanup after a post-spawn guest failure."""
+    source = tmp_path / "readonly-source"
+    source.mkdir()
+    initialize_git(source)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    codex = fake_codex(tmp_path / "codex", body="import time\ntime.sleep(30)\n")
+    workspace_base = tmp_path / "guest-workspaces"
+    workspace_base.mkdir()
+    request, snapshot = guest_request(source)
+    write_control_state = vm_guest._write_control_state
+
+    class TimedOutGuestProcess:
+        args = (str(codex), "exec")
+        pid = 123
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+        @staticmethod
+        def wait(timeout: float | None = None) -> None:
+            raise subprocess.TimeoutExpired(TimedOutGuestProcess.args, timeout)
+
+    original_popen = subprocess.Popen
+
+    def fake_popen(command: object, *args: object, **kwargs: object) -> object:
+        if isinstance(command, tuple | list) and command[:2] == (str(codex), "exec"):
+            return TimedOutGuestProcess()
+        return original_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(vm_guest.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(vm_guest, "_terminate_process_group", lambda _pid: None)
+
+    def fail_after_process_state(
+        path: Path,
+        task_fingerprint: str,
+        workspace: Path,
+        *,
+        process_group: int | None,
+    ) -> None:
+        write_control_state(
+            path,
+            task_fingerprint,
+            workspace,
+            process_group=process_group,
+        )
+        if process_group is not None:
+            raise RuntimeError("post-spawn failure")
+
+    monkeypatch.setattr(vm_guest, "_write_control_state", fail_after_process_state)
+
+    with pytest.raises(RuntimeError, match="post-spawn failure"):
+        execute_guest(
+            workspace_base=workspace_base,
+            kind="implementation",
+            expected_fingerprint="a" * 64,
+            expected_snapshot_digest=snapshot.digest,
+            codex_executable=codex,
+            guest_codex_home=codex_home,
+            request_text=request,
+        )
+
+    assert not (workspace_base / ".cdd-control").exists()
 
 
 def test_guest_rejects_tracked_symlink_before_copying_source(
